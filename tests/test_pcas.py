@@ -10,6 +10,7 @@ from models.base.pcas_losses import (
     teen_calibrate,
 )
 from models.base.pcas_modules import PCASPrompt
+from models.base.pcas_trainer import IndexedDataset
 
 
 class TestPCASLosses(unittest.TestCase):
@@ -66,6 +67,35 @@ class TestPCASPrompt(unittest.TestCase):
         enhanced.square().mean().backward()
         self.assertIsNotNone(module.K.grad)
         self.assertIsNotNone(module.A.grad)
+
+
+
+class TestIndexedDataset(unittest.TestCase):
+    class TwoFieldDataset(torch.utils.data.Dataset):
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, index):
+            return torch.tensor([index]), index + 10
+
+    class ThreeFieldDataset(torch.utils.data.Dataset):
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, index):
+            return torch.tensor([index]), index + 10, 1000 + index
+
+    def test_two_field_dataset_gets_local_index(self):
+        wrapped = IndexedDataset(self.TwoFieldDataset())
+        image, label, index = wrapped[2]
+        self.assertEqual(label, 12)
+        self.assertEqual(index, 2)
+
+    def test_three_field_dataset_metadata_is_not_used_as_cache_index(self):
+        wrapped = IndexedDataset(self.ThreeFieldDataset())
+        image, label, index = wrapped[1]
+        self.assertEqual(label, 11)
+        self.assertEqual(index, 1)
 
 
 if __name__ == "__main__":
