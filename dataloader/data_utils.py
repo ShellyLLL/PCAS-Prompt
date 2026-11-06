@@ -61,7 +61,7 @@ def get_dataloader(args,session):
     return trainset, trainloader, testloader
 
 def get_base_dataloader(args, clip_trsf=None):
-    txt_path = _session_index_path(args, 0)
+    txt_path = None
     class_index = np.arange(args.base_class)
     if args.dataset == 'cifar100':
 
@@ -83,8 +83,8 @@ def get_base_dataloader(args, clip_trsf=None):
       
         testset = args.Dataset.CUB200(root=args.dataroot, train=False, index=class_index, is_clip=args.clip)
     if args.dataset == 'FGVCAircraft':
-      
-        trainset = args.Dataset.FGVCAircraft(root=args.dataroot, train=True, 
+        txt_path = _session_index_path(args, 0)
+        trainset = args.Dataset.FGVCAircraft(root=args.dataroot, train=True,
             index_path=txt_path, base_sess=True, is_clip=args.clip)
         testset = args.Dataset.FGVCAircraft(root=args.dataroot, train=False, 
                                             index=class_index, is_clip=args.clip)
@@ -92,8 +92,8 @@ def get_base_dataloader(args, clip_trsf=None):
        
         
     if args.dataset == 'iNF200':
-       
-        trainset = args.Dataset.iNF200(root=args.dataroot, train=True, 
+        txt_path = _session_index_path(args, 0)
+        trainset = args.Dataset.iNF200(root=args.dataroot, train=True,
             index_path=txt_path, base_sess=True, is_clip=args.clip)
         testset = args.Dataset.iNF200(root=args.dataroot, train=False, 
                                             index=class_index, is_clip=args.clip)
