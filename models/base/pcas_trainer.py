@@ -382,12 +382,12 @@ class PCASFSCILTrainer:
         # change; PCAS and ViT are frozen for every incremental session.
         if self.all_prototypes is None:
             self.all_prototypes = torch.zeros(
-            int(self.args.num_classes),
-            self.base_prototypes.shape[1],
-            device=self.device,
-            dtype=self.base_prototypes.dtype,
-        )
-        self.all_prototypes[:self.args.base_class] = self.base_prototypes
+                int(self.args.num_classes),
+                self.base_prototypes.shape[1],
+                device=self.device,
+                dtype=self.base_prototypes.dtype,
+            )
+            self.all_prototypes[:self.args.base_class] = self.base_prototypes
         for offset, class_id in enumerate(novel_classes):
             self.all_prototypes[int(class_id)] = calibrated[offset]
 
@@ -403,7 +403,13 @@ class PCASFSCILTrainer:
         start = time.time()
         trainset, trainloader, testloader = get_base_dataloader(self.args)
         self._train_base(trainset, trainloader)
-        self.all_prototypes = self.base_prototypes.clone()
+        self.all_prototypes = torch.zeros(
+            int(self.args.num_classes),
+            self.base_prototypes.shape[1],
+            device=self.device,
+            dtype=self.base_prototypes.dtype,
+        )
+        self.all_prototypes[:self.args.base_class] = self.base_prototypes
 
         # Evaluate the base session using the final frozen student prototypes.
         base_metrics = self._evaluate(
