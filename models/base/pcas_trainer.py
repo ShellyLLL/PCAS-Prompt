@@ -92,6 +92,8 @@ class PCASFSCILTrainer:
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         self.seed = int(getattr(args, "seed", 1))
+        if self.seed < 0:
+            self.seed = 1
         self._set_seed(self.seed)
         self.model = PCASViT(self.args).to(self.device)
 
