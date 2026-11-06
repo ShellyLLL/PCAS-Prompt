@@ -4,17 +4,86 @@ import torch
 from dataloader.sampler import CategoriesSampler
 
 def _session_index_path(args, session):
-    root = getattr(args, "index_list_root", os.path.join("data", "index_list"))
-    path = os.path.join(root, args.dataset, "session_{}.txt".format(session + 1))
-    if not os.path.isfile(path):
-        raise FileNotFoundError(
-            "Missing FSCIL session split: {}. Set --index_list_root to the "
-            "directory containing <dataset>/session_N.txt.".format(path)
+    root = getattr(args, "index_list_root", None)
+    if not root:
+        root = os.path.join(getattr(args, "_configured_data_root", args.dataroot), "index_list")
+
+    dataset_dirs = {
+        "cub200": ["cub200"],
+        "cifar100": ["cifar100", "CIFAR100", "CIFAR_100"],
+        "mini_imagenet": ["mini_imagenet", "miniimagenet"],
+    }.get(args.dataset, [args.dataset])
+    filename = "session_{}.txt".format(session + 1)
+    candidates = [os.path.join(root, name, filename) for name in dataset_dirs]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        "Missing FSCIL session split for dataset={!r}, session={}. Checked: {}. "
+        "Expected <index_list_root>/<dataset>/session_N.txt.".format(
+            args.dataset, session + 1, ", ".join(candidates)
         )
-    return path
+    )
+
+
+def _resolve_data_roots(args):
+    """Resolve the user's shared data directory to each loader's expected root."""
+    configured_root = os.path.abspath(os.path.expanduser(args.dataroot))
+    args._configured_data_root = configured_root
+
+    if args.dataset == "cub200":
+        candidates = [
+            configured_root,
+            os.path.join(configured_root, "CUB_200_2011"),
+        ]
+        required = os.path.join("CUB_200_2011", "images.txt")
+        for candidate in candidates:
+            if os.path.isfile(os.path.join(candidate, required)):
+                args.dataroot = candidate
+                return
+        raise FileNotFoundError(
+            "CUB-200 metadata not found. Expected "
+            "<dataroot>/CUB_200_2011/images.txt. Checked roots: {}"
+            .format(", ".join(candidates))
+        )
+
+    if args.dataset == "cifar100":
+        candidates = [
+            os.path.join(configured_root, "CIFAR_100"),
+            configured_root,
+            os.path.join(configured_root, "CIFAR100"),
+        ]
+        required = os.path.join("cifar-100-python", "train")
+        for candidate in candidates:
+            if os.path.isfile(os.path.join(candidate, required)):
+                args.dataroot = candidate
+                return
+        raise FileNotFoundError(
+            "CIFAR-100 pickle files not found. Expected "
+            "<dataroot>/CIFAR_100/cifar-100-python/train. Checked roots: {}"
+            .format(", ".join(candidates))
+        )
+
+    if args.dataset == "mini_imagenet":
+        candidates = [
+            configured_root,
+            os.path.join(configured_root, "miniimagenet"),
+            os.path.dirname(configured_root),
+        ]
+        for candidate in candidates:
+            image_dir = os.path.join(candidate, "miniimagenet", "images")
+            if os.path.isdir(image_dir):
+                args.dataroot = candidate
+                return
+        raise FileNotFoundError(
+            "MiniImageNet images not found. Expected "
+            "<dataroot>/miniimagenet/images. Checked roots: {}"
+            .format(", ".join(candidates))
+        )
 
 
 def set_up_datasets(args):
+    _resolve_data_roots(args)
     if args.dataset == 'cifar100':
         import dataloader.cifar100.cifar as Dataset
         args.base_class = 60
@@ -51,6 +120,13 @@ def set_up_datasets(args):
         args.shot = 5
         args.sessions = 11 
     args.Dataset=Dataset
+
+    # Fail before model construction / pretrained-weight download if a required
+    # incremental split is absent. Base-session class selection is class-index
+    # based for all three supported datasets.
+    for session in range(1, args.sessions):
+        _session_index_path(args, session)
+
     return args
 
 def get_dataloader(args,session):
@@ -106,10 +182,14 @@ def get_base_dataloader(args, clip_trsf=None):
         testset = args.Dataset.MiniImageNet(root=args.dataroot, train=False, index=class_index, is_clip=args.clip)
     
 
-    trainloader = torch.utils.data.DataLoader(dataset=trainset, batch_size=args.batch_size_base, shuffle=True,
-                                              num_workers=4)
+    trainloader = torch.utils.data.DataLoader(
+        dataset=trainset, batch_size=args.batch_size_base, shuffle=True,
+        num_workers=args.num_workers, pin_memory=torch.cuda.is_available()
+    )
     testloader = torch.utils.data.DataLoader(
-        dataset=testset, batch_size=args.test_batch_size, shuffle=False, num_workers=4)
+        dataset=testset, batch_size=args.test_batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=torch.cuda.is_available()
+    )
 
     return trainset, trainloader, testloader
 
