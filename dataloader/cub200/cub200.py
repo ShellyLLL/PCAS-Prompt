@@ -118,14 +118,56 @@ class CUB200(Dataset):
                 self.data2label[image_path] = (int(id2class[k]) - 1)
 
     def SelectfromTxt(self, data2label, index_path):
-        index = open(index_path).read().splitlines()
+        if not index_path or not os.path.isfile(index_path):
+            raise FileNotFoundError("CUB session index file not found: {}".format(index_path))
+
         data_tmp = []
         targets_tmp = []
-        for i in index:
-            img_path = os.path.join(self.root, i)
-            data_tmp.append(img_path)
-            targets_tmp.append(data2label[img_path])
+        missing = []
+        for raw_line in open(index_path, "r", encoding="utf-8"):
+            item = raw_line.strip().replace("\\\\", "/")
+            if not item:
+                continue
 
+            candidates = []
+            if os.path.isabs(item):
+                candidates.append(item)
+            else:
+                normalized = item.lstrip("./")
+                candidates.extend([
+                    os.path.join(self.root, normalized),
+                    os.path.join(self.root, "CUB_200_2011", normalized),
+                ])
+                if normalized.startswith("images/"):
+                    candidates.append(os.path.join(self.root, "CUB_200_2011", normalized))
+                if normalized.startswith("CUB_200_2011/"):
+                    candidates.append(os.path.join(self.root, normalized))
+
+            resolved = next((p for p in candidates if os.path.isfile(p)), None)
+            if resolved is None:
+                basename = os.path.basename(item)
+                matches = [
+                    path for path in data2label
+                    if os.path.basename(path) == basename
+                ]
+                if len(matches) == 1:
+                    resolved = matches[0]
+
+            if resolved is None or resolved not in data2label:
+                missing.append(item)
+                continue
+
+            data_tmp.append(resolved)
+            targets_tmp.append(int(data2label[resolved]))
+
+        if missing:
+            preview = ", ".join(missing[:5])
+            raise RuntimeError(
+                "CUB session index {} contains {} unresolved image paths. "
+                "Examples: {}".format(index_path, len(missing), preview)
+            )
+        if not data_tmp:
+            raise RuntimeError("CUB session index is empty: {}".format(index_path))
         return data_tmp, targets_tmp
 
     def SelectfromClasses(self, data, targets, index):
