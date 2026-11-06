@@ -1,6 +1,18 @@
+import os
 import numpy as np
 import torch
 from dataloader.sampler import CategoriesSampler
+
+def _session_index_path(args, session):
+    root = getattr(args, "index_list_root", os.path.join("data", "index_list"))
+    path = os.path.join(root, args.dataset, "session_{}.txt".format(session + 1))
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            "Missing FSCIL session split: {}. Set --index_list_root to the "
+            "directory containing <dataset>/session_N.txt.".format(path)
+        )
+    return path
+
 
 def set_up_datasets(args):
     if args.dataset == 'cifar100':
@@ -49,7 +61,7 @@ def get_dataloader(args,session):
     return trainset, trainloader, testloader
 
 def get_base_dataloader(args, clip_trsf=None):
-    txt_path = "/data/fscil_data/code/LGSP/data/index_list/" + args.dataset + "/session_" + str(0 + 1) + '.txt'
+    txt_path = _session_index_path(args, 0)
     class_index = np.arange(args.base_class)
     if args.dataset == 'cifar100':
 
@@ -112,7 +124,7 @@ def get_dataloader_RAPF(args, session):
                                                 num_workers=4)
         return trainloader
     else:
-        txt_path = "/data/fscil_data/code/LGSP/data/index_list/" + args.dataset + "/session_" + str(session + 1) + '.txt'
+        txt_path = _session_index_path(args, session)
         if args.dataset == 'cub200':
             trainset = args.Dataset.CUB200(root=args.dataroot, train=True,
                                         index_path=txt_path, is_clip=args.clip)
@@ -134,7 +146,7 @@ def get_standard_data_loader(args):
 
 def get_base_dataloader_meta(args):
    
-    txt_path = "/data/fscil_data/code/LGSP/data/index_list/" + args.dataset + "/session_" + str(0 + 1) + '.txt'
+    txt_path = _session_index_path(args, 0)
     class_index = np.arange(args.base_class)
     if args.dataset == 'cifar100':
         trainset = args.Dataset.CIFAR100(root=args.dataroot, train=True, download=True,
@@ -166,7 +178,7 @@ def get_base_dataloader_meta(args):
     return trainset, trainloader, testloader
 
 def get_new_dataloader(args, session, clip_trsf=None):
-    txt_path = "/data/fscil_data/code/LGSP/data/index_list/" + args.dataset + "/session_" + str(session + 1) + '.txt'
+    txt_path = _session_index_path(args, session)
     if args.dataset == 'cifar100':
         if args.clip:
             class_index = open(txt_path).read().splitlines()

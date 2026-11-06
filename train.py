@@ -5,7 +5,7 @@ import torch
 
 MODEL_DIR=None
 # DATA_DIR = './local_datasets/'
-DATA_DIR = '/data/fscil_data/dataset/CUB_200_2011/'
+DATA_DIR = './data'
 PROJECT='base'
 
 def get_command_line_parser():
@@ -14,7 +14,27 @@ def get_command_line_parser():
     # about dataset and network
     parser.add_argument('-project', type=str, default=PROJECT)
     parser.add_argument('-dataroot', type=str, default=DATA_DIR)
-    parser.add_argument('-out', type=str, default=None)
+    parser.add_argument('-out', type=str, default='PCAS')
+    parser.add_argument('--index_list_root', type=str, default='./data/index_list',
+                        help='Root containing <dataset>/session_N.txt FSCIL splits.')
+    parser.add_argument('--pcas_layer', type=int, default=6)
+    parser.add_argument('--bottleneck_dim', type=int, default=96)
+    parser.add_argument('--num_components', type=int, default=4)
+    parser.add_argument('--prompt_dropout', type=float, default=0.1)
+    parser.add_argument('--route_temperature', type=float, default=0.2)
+    parser.add_argument('--residual_init', type=float, default=0.1)
+    parser.add_argument('--classes_per_batch', type=int, default=16)
+    parser.add_argument('--samples_per_class', type=int, default=4)
+    parser.add_argument('--pcas_lr', type=float, default=1e-3)
+    parser.add_argument('--pcas_head_lr', type=float, default=1e-3)
+    parser.add_argument('--pcas_weight_decay', type=float, default=1e-4)
+    parser.add_argument('--lambda_proto', type=float, default=0.5)
+    parser.add_argument('--lambda_affinity', type=float, default=0.1)
+    parser.add_argument('--beta_affinity', type=float, default=0.5)
+    parser.add_argument('--affinity_scale', type=float, default=16.0)
+    parser.add_argument('--pcas_logit_scale', type=float, default=16.0)
+    parser.add_argument('--teen_alpha', type=float, default=0.5)
+    parser.add_argument('--teen_tau', type=float, default=16.0)
 
     parser.add_argument('-epochs_base', type=int, default=50)
     parser.add_argument('-epochs_new', type=int, default=20)
@@ -54,7 +74,7 @@ def get_command_line_parser():
     parser.add_argument('-set_no_val', action='store_true', help='set validation using test set or no validation')
 
     # about training
-    parser.add_argument('-gpu', default='2, 3')
+    parser.add_argument('-gpu', default='0')
     parser.add_argument('-num_workers', type=int, default=4)
     parser.add_argument('-seed', type=int, default=-1)
     # parser.add_argument('-seeds', nargs='+', help='<Required> Set flag', required=True, default=1)

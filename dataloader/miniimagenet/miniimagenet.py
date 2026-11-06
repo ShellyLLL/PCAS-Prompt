@@ -43,9 +43,13 @@ class MiniImageNet(Dataset):
             self.targets.append(lb)
             self.data2label[path] = lb
         
+        # Class names are optional metadata. Do not depend on a developer-local
+        # absolute path for loading the dataset or running FSCIL experiments.
         self.classes = self.mapping_clsidx_to_txt()
-        for i in range(len(self.wnids)):
-            self.wnids[i] = self.classes[list(self.classes.keys())[i]]
+        if self.classes:
+            self.wnids = [
+                self.classes.get(name, name) for name in self.wnids
+            ]
         
 
         if train:
@@ -100,7 +104,10 @@ class MiniImageNet(Dataset):
     def mapping_clsidx_to_txt(self):
         classes = {}
         # 这里的路径需要修改一下
-        lines = [x.strip() for x in open('/home/jyw/SuperMan/PriViLege/dataloader/miniimagenet/map_clsloc.txt', 'r').readlines()][1:]
+        map_path = osp.join(osp.dirname(__file__), "map_clsloc.txt")
+        if not osp.isfile(map_path):
+            return classes
+        lines = [x.strip() for x in open(map_path, 'r').readlines()][1:]
         for l in lines:
             name, class_num, class_txt = l.split(' ')
             if name not in classes.keys():
