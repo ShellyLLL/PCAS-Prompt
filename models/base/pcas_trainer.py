@@ -74,6 +74,12 @@ class ClassBalancedBatchSampler(Sampler):
 
 
 class IndexedDataset(torch.utils.data.Dataset):
+    """Attach the local dataset position to a (image, label) sample.
+
+    The local position is deliberately used instead of a dataset-provided
+    third field: PCAS prototype caches are built in this dataset's iteration
+    order, so leave-one-out indices must address that exact order.
+    """
     def __init__(self, dataset):
         self.dataset = dataset
 
@@ -81,7 +87,21 @@ class IndexedDataset(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, index):
-        image, label = self.dataset[index]
+        sample = self.dataset[index]
+        if not isinstance(sample, (tuple, list)):
+            raise TypeError(
+                "PCAS datasets must return (image, label) or "
+                "(image, label, metadata); got {!r}.".format(type(sample))
+            )
+        if len(sample) == 2:
+            image, label = sample
+        elif len(sample) == 3:
+            image, label, _ = sample
+        else:
+            raise ValueError(
+                "PCAS datasets must return 2 or 3 fields; got {}."
+                .format(len(sample))
+            )
         return image, int(label), int(index)
 
 
@@ -152,8 +172,13 @@ class PCASFSCILTrainer:
     def _extract_features(self, dataset, teacher=False, batch_size=None):
         original_transform = dataset.transform
         dataset.transform = self._make_eval_transform(dataset)
+        # All current dataset implementations return (image, label), while
+        # feature extraction and the PCAS cache contract also need the stable
+        # local sample position. Wrap here instead of changing each dataset's
+        # public __getitem__ API.
+        indexed_dataset = IndexedDataset(dataset)
         loader = self._loader(
-            dataset,
+            indexed_dataset,
             batch_size or int(getattr(self.args, "test_batch_size", 128)),
             shuffle=False,
         )
