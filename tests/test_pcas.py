@@ -10,7 +10,7 @@ from models.base.pcas_losses import (
     teen_calibrate,
 )
 from models.base.pcas_modules import PCASPrompt
-from models.base.pcas_trainer import IndexedDataset
+from models.base.pcas_trainer import IndexedDataset, compute_taskwise_accuracy
 
 
 class TestPCASLosses(unittest.TestCase):
@@ -96,6 +96,37 @@ class TestIndexedDataset(unittest.TestCase):
         image, label, index = wrapped[1]
         self.assertEqual(label, 11)
         self.assertEqual(index, 1)
+
+
+class TestTaskwiseAccuracy(unittest.TestCase):
+    def test_triangular_task_accuracy_by_global_class_ranges(self):
+        # Base task has 4 classes; each incremental task adds 2 classes.
+        labels = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+        predictions = torch.tensor([0, 1, 0, 3, 4, 4, 6, 7, 8, 0])
+        values = compute_taskwise_accuracy(
+            labels, predictions, base_class=4, way=2, session=2
+        )
+        self.assertEqual(len(values), 3)
+        self.assertAlmostEqual(values[0], 0.75)
+        self.assertAlmostEqual(values[1], 0.50)
+        self.assertAlmostEqual(values[2], 0.50)
+
+    def test_session_zero_contains_only_base_task(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        predictions = torch.tensor([0, 1, 1, 3])
+        values = compute_taskwise_accuracy(
+            labels, predictions, base_class=4, way=2, session=0
+        )
+        self.assertEqual(len(values), 1)
+        self.assertAlmostEqual(values[0], 0.75)
+
+    def test_rejects_missing_task_samples(self):
+        labels = torch.tensor([0, 1, 2, 3, 4, 5])
+        predictions = labels.clone()
+        with self.assertRaisesRegex(ValueError, "No test samples found for task 2"):
+            compute_taskwise_accuracy(
+                labels, predictions, base_class=4, way=2, session=2
+            )
 
 
 if __name__ == "__main__":
