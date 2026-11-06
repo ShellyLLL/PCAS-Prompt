@@ -5,7 +5,7 @@ import torch
 
 MODEL_DIR=None
 # DATA_DIR = './local_datasets/'
-DATA_DIR = './data'
+DATA_DIR = '/data/lx/fscil/data'
 PROJECT='base'
 
 def get_command_line_parser():
@@ -15,8 +15,8 @@ def get_command_line_parser():
     parser.add_argument('-project', type=str, default=PROJECT)
     parser.add_argument('-dataroot', type=str, default=DATA_DIR)
     parser.add_argument('-out', type=str, default='PCAS')
-    parser.add_argument('--index_list_root', type=str, default='./data/index_list',
-                        help='Root containing <dataset>/session_N.txt FSCIL splits.')
+    parser.add_argument('--index_list_root', type=str, default=None,
+                        help='Session split root. Defaults to <dataroot>/index_list.')
     parser.add_argument('--pcas_layer', type=int, default=6)
     parser.add_argument('--bottleneck_dim', type=int, default=96)
     parser.add_argument('--num_components', type=int, default=4)
