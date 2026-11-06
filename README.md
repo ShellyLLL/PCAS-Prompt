@@ -1,10 +1,3 @@
-## 💡 Highlights
-
-<div align="center">
-<img src="method_overview.jpg" width="100%" />
-</div>
-
-
 ## 📦 Installation
 
 ### Prerequisites
