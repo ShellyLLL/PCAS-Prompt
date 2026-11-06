@@ -105,6 +105,52 @@ class IndexedDataset(torch.utils.data.Dataset):
         return image, int(label), int(index)
 
 
+def compute_taskwise_accuracy(labels, predictions, base_class, way, session):
+    """Return per-task accuracies after the given FSCIL session.
+
+    Task 0 is the base class block [0, base_class). Each incremental task
+    contains one contiguous block of 'way' global class IDs. Both labels
+    and predictions are evaluated in the same global label space.
+    """
+    labels = torch.as_tensor(labels).long()
+    predictions = torch.as_tensor(predictions).long().to(labels.device)
+    if labels.ndim != 1 or predictions.ndim != 1 or labels.shape != predictions.shape:
+        raise ValueError("labels and predictions must be aligned 1-D tensors.")
+    if labels.numel() == 0:
+        raise ValueError("Cannot compute task-wise accuracy on an empty test set.")
+
+    base_class = int(base_class)
+    way = int(way)
+    session = int(session)
+    if base_class <= 0 or way <= 0 or session < 0:
+        raise ValueError("base_class and way must be positive; session cannot be negative.")
+
+    seen_classes = base_class + session * way
+    if torch.any(labels < 0) or torch.any(labels >= seen_classes):
+        raise ValueError(
+            "Test labels fall outside the classes expected at session {}."
+            .format(session)
+        )
+
+    task_accuracies = []
+    task_ranges = [(0, base_class)]
+    task_ranges.extend(
+        (base_class + (task_id - 1) * way,
+         base_class + task_id * way)
+        for task_id in range(1, session + 1)
+    )
+    for task_id, (start_class, end_class) in enumerate(task_ranges):
+        mask = (labels >= start_class) & (labels < end_class)
+        if not torch.any(mask):
+            raise ValueError(
+                "No test samples found for task {} (classes {}..{})."
+                .format(task_id, start_class, end_class - 1)
+            )
+        task_accuracy = (predictions[mask] == labels[mask]).float().mean()
+        task_accuracies.append(float(task_accuracy.item()))
+    return task_accuracies
+
+
 class PCASFSCILTrainer:
     def __init__(self, args):
         self.args = set_up_datasets(args)
@@ -127,7 +173,11 @@ class PCASFSCILTrainer:
         self.base_prototypes = None
         self.base_teacher_prototypes = None
         self.base_accuracy = None
+        # Macro class accuracy is retained for AA/PD. These histories add the
+        # standard FSCIL cumulative and task-wise session accuracy report.
         self.session_accuracies = []
+        self.final_accuracies = []
+        self.task_wise_accuracies = []
         self.results = []
 
     @staticmethod
@@ -357,7 +407,7 @@ class PCASFSCILTrainer:
         )
 
     @torch.no_grad()
-    def _evaluate(self, testset, seen_classes, all_prototypes):
+    def _evaluate(self, testset, seen_classes, all_prototypes, session):
         features, labels, _ = self._extract_features(testset, teacher=False)
         logits = float(getattr(self.args, "pcas_logit_scale", 16.0)) * (
             features @ F.normalize(all_prototypes, dim=-1).t()
@@ -365,6 +415,13 @@ class PCASFSCILTrainer:
         logits = logits[:, :seen_classes]
         predictions = logits.argmax(dim=1)
         accuracy = (predictions == labels).float().mean().item()
+        task_wise_accuracy = compute_taskwise_accuracy(
+            labels, predictions,
+            base_class=self.args.base_class,
+            way=self.args.way,
+            session=session,
+        )
+
         per_class_accuracy = []
         for class_id in range(seen_classes):
             class_mask = labels == class_id
@@ -392,6 +449,7 @@ class PCASFSCILTrainer:
             "class_average_accuracy": class_average_accuracy,
             "base_accuracy": base_acc,
             "novel_accuracy": novel_acc,
+            "task_wise_accuracy": task_wise_accuracy,
         }
 
     @torch.no_grad()
@@ -439,11 +497,22 @@ class PCASFSCILTrainer:
             self.all_prototypes[int(class_id)] = calibrated[offset]
 
         seen_classes = self.args.base_class + session * self.args.way
-        metrics = self._evaluate(testset, seen_classes, self.all_prototypes)
+        metrics = self._evaluate(
+            testset, seen_classes, self.all_prototypes, session=session
+        )
         metrics.update({"session": session, "novel_classes": novel_classes.tolist()})
         self.results.append(metrics)
         self.session_accuracies.append(metrics["class_average_accuracy"])
+        self.final_accuracies.append(metrics["accuracy"])
+        self.task_wise_accuracies.append(metrics["task_wise_accuracy"])
         print("[PCAS incremental]", metrics)
+        print(
+            "[PCAS session {}] Final acc: {:.2f}; Task-wise acc: {}".format(
+                session,
+                metrics["accuracy"] * 100.0,
+                [round(value * 100.0, 2) for value in metrics["task_wise_accuracy"]],
+            )
+        )
         return metrics
 
     def train(self):
@@ -460,13 +529,22 @@ class PCASFSCILTrainer:
 
         # Evaluate the base session using the final frozen student prototypes.
         base_metrics = self._evaluate(
-            testloader.dataset, self.args.base_class, self.all_prototypes
+            testloader.dataset, self.args.base_class, self.all_prototypes,
+            session=0,
         )
         base_metrics.update({"session": 0})
         self.results.append(base_metrics)
         self.base_accuracy = base_metrics["accuracy"]
         self.session_accuracies.append(base_metrics["class_average_accuracy"])
+        self.final_accuracies.append(base_metrics["accuracy"])
+        self.task_wise_accuracies.append(base_metrics["task_wise_accuracy"])
         print("[PCAS base]", base_metrics)
+        print(
+            "[PCAS session 0] Final acc: {:.2f}; Task-wise acc: {}".format(
+                base_metrics["accuracy"] * 100.0,
+                [round(value * 100.0, 2) for value in base_metrics["task_wise_accuracy"]],
+            )
+        )
 
         for session in range(1, int(self.args.sessions)):
             trainset, _, testloader = get_new_dataloader(self.args, session)
@@ -481,8 +559,22 @@ class PCASFSCILTrainer:
             "mean_session_class_accuracy": float(np.mean(self.session_accuracies)),
             "PD": float(pd),
             "session_accuracies": self.session_accuracies,
+            "final_acc_by_session": self.final_accuracies,
+            "task_wise_accuracies": self.task_wise_accuracies,
         }
         print("[PCAS summary]", summary)
+        print(
+            "Final acc: {}".format(
+                [round(value * 100.0, 2) for value in self.final_accuracies]
+            )
+        )
+        print("Task-wise acc:")
+        for task_id, values in enumerate(self.task_wise_accuracies):
+            print(
+                "task {}, acc: {}".format(
+                    task_id, [round(value * 100.0, 2) for value in values]
+                )
+            )
         self.results.append(summary)
         torch.save(
             {
@@ -490,6 +582,8 @@ class PCASFSCILTrainer:
                 "base_student_prototypes": self.base_prototypes.cpu(),
                 "all_prototypes": self.all_prototypes.cpu(),
                 "session_accuracies": self.session_accuracies,
+                "final_acc_by_session": self.final_accuracies,
+                "task_wise_accuracies": self.task_wise_accuracies,
                 "summary": summary,
                 "results": self.results,
             },
