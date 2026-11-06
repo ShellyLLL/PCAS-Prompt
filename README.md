@@ -27,7 +27,7 @@ The implementation follows the revised PCAS definition:
 
 ## Data preparation
 
-Keep the dataset layout expected by the original LGSP loaders. Session split files are configured independently from the image root:
+The loaders accept the shared dataset root used in the experiment server. For the layout shown in the project setup, use `/data/lx/fscil/data` as `-dataroot`. The resolver maps each dataset to its actual nested directory and reports a clear error if required files are missing. Session split files default to `<dataroot>/index_list`; `--index_list_root` can override this.
 
 ```text
 data/
@@ -47,24 +47,32 @@ Use a PyTorch/torchvision build compatible with the selected CUDA runtime. Insta
 
 ## Run
 
-Example CUB-200 run:
+Use the server's shared data directory for all three datasets:
 
 ```bash
-python train.py \
-  -project base \
-  -dataset cub200 \
-  -vit \
-  -dataroot /path/to/dataset-root \
-  --index_list_root /path/to/data/index_list \
-  -gpu 0 \
-  -seed 1 \
-  -epochs_base 100 \
-  -batch_size_base 64 \
-  --classes_per_batch 16 \
-  --samples_per_class 4
+DATA_ROOT=/data/lx/fscil/data
+
+# CUB-200-2011
+python train.py -project base -dataset cub200 -vit \
+  -dataroot "$DATA_ROOT" -gpu 0 -seed 1 \
+  -epochs_base 50 -num_workers 4 -test_batch_size 64 \
+  --classes_per_batch 16 --samples_per_class 4
+
+# CIFAR-100
+python train.py -project base -dataset cifar100 -vit \
+  -dataroot "$DATA_ROOT" -gpu 0 -seed 1 \
+  -epochs_base 50 -num_workers 4 -test_batch_size 64 \
+  --classes_per_batch 16 --samples_per_class 4
+
+# MiniImageNet
+python train.py -project base -dataset mini_imagenet -vit \
+  -dataroot "$DATA_ROOT" -gpu 0 -seed 1 \
+  -epochs_base 50 -num_workers 4 -test_batch_size 64 \
+  --classes_per_batch 16 --samples_per_class 4
 ```
 
-For CUB, `dataroot` should contain `CUB_200_2011/images.txt` and the other CUB metadata files. The index-list root should contain `cub200/session_N.txt` files. Adjust the dataset root and split root for other datasets.
+The default `--index_list_root` is `$DATA_ROOT/index_list`; pass it explicitly only when your session splits are stored elsewhere. Before constructing the model, setup checks that every incremental session file exists.
+
 
 Important PCAS defaults:
 
