@@ -1,31 +1,9 @@
-# [ICCV2025]LGSP-Prompt: Revisiting Pool-based Prompt Learning for Few-shot Class-incremental Learning
-
-<div align="center">
-
-[![ICCV 2025](https://img.shields.io/badge/ICCV-2025-blue)](https://iccv.thecvf.com/)
-[![arXiv](https://img.shields.io/badge/arXiv-2507.09183-red)](https://arxiv.org/abs/2507.09183)
-[![GitHub Stars](https://img.shields.io/github/stars/Jywsuperman/LGSP?style=social)](https://github.com/Jywsuperman/LGSP)
-[![License](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
-
-**Authors:** Yongwei Jiang, Yixiong Zou*, Yuhua Li, Ruixuan Li  
-**Affiliation:** School of Computer Science and Technology, Huazhong University of Science and Technology
-
-</div>
-
----
-
-## 🔥 News
-
-* **`2025.09.28`** 📝 Code and implementation released
-* **`2025.06.26`** 🎉 Our paper is **accepted at ICCV 2025**!
-
 ## 💡 Highlights
 
 <div align="center">
 <img src="method_overview.jpg" width="100%" />
 </div>
 
-> **TLDR:** We present the **first study** of pool-based prompt learning in FSCIL settings, revealing **token-dimension saturation** issues when applying L2P to few-shot scenarios, and propose **LGSP-Prompt** that innovatively shifts from token dimension to **spatial dimension** for superior performance.
 
 ## 📦 Installation
 
@@ -159,45 +137,8 @@ python train.py \
 
 **Note**: For different datasets, simply change the `dataset` variable in the configuration file.
 
-## 📜 Citation
-
-If you find our work useful for your research, please cite:
-
-```bibtex
-@misc{jiang2025revisitingpoolbasedpromptlearning,
-      title={Revisiting Pool-based Prompt Learning for Few-shot Class-incremental Learning}, 
-      author={Yongwei Jiang and Yixiong Zou and Yuhua Li and Ruixuan Li},
-      year={2025},
-      eprint={2507.09183},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2507.09183}, 
-}
-```
-
-## 🤝 Acknowledgments
-
-We thank the authors of the following works that inspired our research:
-- [L2P](https://github.com/JH-LEE-KR/l2p-pytorch) for pioneering prompt pool learning
-- [VPT](https://github.com/KMnP/vpt) for visual prompt tuning foundation
-- [PriViLege](https://github.com/KU-VGI/PriViLege) for FSCIL baselines
-
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 📧 Contact
-
-- **Yongwei Jiang**: jiangyongwei@hust.edu.cn
-- **GitHub Issues**: [Create an issue](https://github.com/Jywsuperman/LGSP/issues)
-
 ---
 
 <div align="center">
-
-**🌟 Star this repo if you find it helpful! 🌟**
-
-*"From token saturation to spatial innovation - rethinking prompt learning for FSCIL"*
 
 </div>
