@@ -20,11 +20,23 @@ class MiniImageNet(Dataset):
         self.root = os.path.expanduser(root)
         self.transform = transform
         self.train = train  # training set or test set
-        self.IMAGE_PATH = os.path.join(root, 'miniimagenet/images')
-        self.SPLIT_PATH = os.path.join(root, 'miniimagenet/split')
+        self.IMAGE_PATH = osp.join(self.root, "miniimagenet", "images")
+        self.SPLIT_PATH = osp.join(self.root, "miniimagenet", "split")
 
-        csv_path = osp.join(self.SPLIT_PATH, setname + '.csv')
-        lines = [x.strip() for x in open(csv_path, 'r').readlines()][1:]
+        csv_candidates = [
+            osp.join(self.root, "miniimagenet", setname + ".csv"),
+            osp.join(self.SPLIT_PATH, setname + ".csv"),
+        ]
+        csv_path = next((p for p in csv_candidates if osp.isfile(p)), None)
+        if csv_path is None:
+            raise FileNotFoundError(
+                "MiniImageNet {}.csv not found. Checked: {}".format(
+                    setname, ", ".join(csv_candidates)
+                )
+            )
+        if not osp.isdir(self.IMAGE_PATH):
+            raise FileNotFoundError("MiniImageNet image directory not found: {}".format(self.IMAGE_PATH))
+        lines = [x.strip() for x in open(csv_path, "r", encoding="utf-8").readlines()][1:]
 
         self.data = []
         self.targets = []
@@ -77,17 +89,49 @@ class MiniImageNet(Dataset):
 
 
     def SelectfromTxt(self, data2label, index_path):
-        index=[]
-        lines = [x.strip() for x in open(index_path, 'r').readlines()]
-        for line in lines:
-            index.append(line.split('/')[3])
+        if not index_path or not osp.isfile(index_path):
+            raise FileNotFoundError("MiniImageNet session index file not found: {}".format(index_path))
+
+        basename_to_paths = {}
+        for path in data2label:
+            basename_to_paths.setdefault(osp.basename(path), []).append(path)
+
         data_tmp = []
         targets_tmp = []
-        for i in index:
-            img_path = os.path.join(self.IMAGE_PATH, i)
-            data_tmp.append(img_path)
-            targets_tmp.append(data2label[img_path])
+        missing = []
+        for raw_line in open(index_path, "r", encoding="utf-8"):
+            line = raw_line.strip().replace("\\\\", "/")
+            if not line:
+                continue
+            normalized = line.lstrip("./")
+            candidates = []
+            if osp.isabs(line):
+                candidates.append(line)
+            candidates.extend([
+                osp.join(self.root, normalized),
+                osp.join(self.IMAGE_PATH, osp.basename(normalized)),
+            ])
+            if "/images/" in normalized:
+                candidates.append(osp.join(self.IMAGE_PATH, normalized.split("/images/", 1)[1]))
 
+            resolved = next((p for p in candidates if p in data2label and osp.isfile(p)), None)
+            if resolved is None:
+                matches = basename_to_paths.get(osp.basename(normalized), [])
+                if len(matches) == 1:
+                    resolved = matches[0]
+            if resolved is None:
+                missing.append(line)
+                continue
+            data_tmp.append(resolved)
+            targets_tmp.append(int(data2label[resolved]))
+
+        if missing:
+            raise RuntimeError(
+                "MiniImageNet session index {} has {} unresolved paths. Examples: {}"
+                .format(index_path, len(missing), ", ".join(missing[:5]))
+            )
+        if not data_tmp:
+            raise RuntimeError("MiniImageNet session index is empty: {}".format(index_path))
         return data_tmp, targets_tmp
 
     def SelectfromClasses(self, data, targets, index):
