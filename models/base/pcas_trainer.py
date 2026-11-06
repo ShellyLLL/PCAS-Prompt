@@ -197,6 +197,15 @@ class PCASFSCILTrainer:
         )
 
     def _train_base(self, trainset, trainloader):
+        observed_base_classes = np.unique(np.asarray(trainset.targets)).astype(int)
+        expected_base_classes = np.arange(int(self.args.base_class), dtype=int)
+        if not np.array_equal(observed_base_classes, expected_base_classes):
+            raise RuntimeError(
+                "Base training split contains class IDs {} but expected {}. "
+                "Check dataset class ordering and base split construction."
+                .format(observed_base_classes.tolist(), expected_base_classes.tolist())
+            )
+
         classes_per_batch = int(getattr(self.args, "classes_per_batch", 16))
         samples_per_class = int(getattr(self.args, "samples_per_class", 4))
         sampler = ClassBalancedBatchSampler(
@@ -363,6 +372,17 @@ class PCASFSCILTrainer:
     @torch.no_grad()
     def _incremental_session(self, trainset, testset, session):
         novel_classes = np.unique(np.asarray(trainset.targets)).astype(int)
+        expected_classes = np.arange(
+            self.args.base_class + (session - 1) * self.args.way,
+            self.args.base_class + session * self.args.way,
+            dtype=int,
+        )
+        if not np.array_equal(novel_classes, expected_classes):
+            raise RuntimeError(
+                "Session {} support split has class IDs {} but expected {}. "
+                "Check this dataset's session_N.txt format and class ordering."
+                .format(session, novel_classes.tolist(), expected_classes.tolist())
+            )
         support_features, support_labels, _ = self._extract_features(
             trainset, teacher=False
         )
