@@ -1,0 +1,11 @@
+# 数据集
+data/
+*.pth
+*.ckpt
+output/
+logs/
+runs/
+__pycache__/
+*.pyc
+.DS_Store
+*.ipynb_checkpoints
