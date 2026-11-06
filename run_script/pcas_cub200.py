@@ -19,7 +19,7 @@ ARGS = [
 
 if __name__ == "__main__":
     subprocess.run(
-        [sys.executable, "../train.py"] + ARGS,
+        [sys.executable, "train.py"] + ARGS,
         cwd="/data/lx/fscil/code/PCAS-Prompt",
         check=True,
     )
