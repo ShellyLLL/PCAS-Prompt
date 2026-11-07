@@ -33,7 +33,7 @@ def get_command_line_parser():
     parser.add_argument('--samples_per_class', type=int, default=4)
     parser.add_argument('--pcas_lr', type=float, default=1e-3)
     parser.add_argument('--pcas_head_lr', type=float, default=1e-3)
-    parser.add_argument('--pcas_weight_decay', type=float, default=1e-4)
+    parser.add_argument('--pcas_weight_decay', type=float, default=0.01)
     parser.add_argument('--lambda_proto', type=float, default=0.5)
     parser.add_argument('--lambda_affinity', type=float, default=0.1)
     parser.add_argument('--beta_affinity', type=float, default=0.5)
@@ -42,7 +42,7 @@ def get_command_line_parser():
     parser.add_argument('--teen_alpha', type=float, default=0.5)
     parser.add_argument('--teen_tau', type=float, default=16.0)
 
-    parser.add_argument('-epochs_base', type=int, default=50)
+    parser.add_argument('-epochs_base', type=int, default=100)
     parser.add_argument('-epochs_new', type=int, default=20)
     parser.add_argument('-lr_base', type=float, default=0.1)
     parser.add_argument('-lr_new', type=float, default=2e-4)
