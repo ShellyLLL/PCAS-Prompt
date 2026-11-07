@@ -99,7 +99,8 @@ class PCASPrompt(nn.Module):
         self.gamma_logit = nn.Parameter(torch.tensor(residual_logit, dtype=torch.float32))
 
         nn.init.kaiming_normal_(self.down.weight, mode="fan_out", nonlinearity="linear")
-        nn.init.xavier_uniform_(self.query.weight)
+        if self.query is not None:
+            nn.init.xavier_uniform_(self.query.weight)
 
     @property
     def residual_scale(self) -> torch.Tensor:
