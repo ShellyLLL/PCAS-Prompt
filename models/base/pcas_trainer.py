@@ -228,6 +228,7 @@ class PCASFSCILTrainer:
         # Macro class accuracy is retained for AA/PD. These histories add the
         # standard FSCIL cumulative and task-wise session accuracy report.
         self.session_accuracies = []
+        self.base_session_accuracies = []
         self.final_accuracies = []
         self.task_wise_accuracies = []
         self.results = []
@@ -684,6 +685,7 @@ class PCASFSCILTrainer:
         metrics.update({"session": session, "novel_classes": novel_classes.tolist()})
         self.results.append(metrics)
         self.session_accuracies.append(metrics["class_average_accuracy"])
+        self.base_session_accuracies.append(metrics["base_accuracy"])
         self.final_accuracies.append(metrics["accuracy"])
         self.task_wise_accuracies.append(metrics["task_wise_accuracy"])
         print("[PCAS incremental]", metrics)
@@ -741,6 +743,7 @@ class PCASFSCILTrainer:
         self.results.append(base_metrics)
         self.base_accuracy = base_metrics["accuracy"]
         self.session_accuracies.append(base_metrics["class_average_accuracy"])
+        self.base_session_accuracies.append(base_metrics["base_accuracy"])
         self.final_accuracies.append(base_metrics["accuracy"])
         self.task_wise_accuracies.append(base_metrics["task_wise_accuracy"])
         print("[PCAS base]", base_metrics)
@@ -755,9 +758,12 @@ class PCASFSCILTrainer:
             trainset, _, testloader = get_new_dataloader(self.args, session)
             self._incremental_session(trainset, testloader.dataset, session)
 
+        # Compare base-class accuracy at session 0 and the final session.
+        # Comparing macro accuracy across growing class populations conflates
+        # retention with the addition of new classes.
         pd = (
-            self.session_accuracies[0] - self.session_accuracies[-1]
-            if len(self.session_accuracies) > 1 else 0.0
+            self.base_session_accuracies[0] - self.base_session_accuracies[-1]
+            if len(self.base_session_accuracies) > 1 else 0.0
         )
         mean_session_accuracy = float(np.mean(self.session_accuracies))
         final_session_class_accuracy = float(self.session_accuracies[-1])
@@ -769,6 +775,7 @@ class PCASFSCILTrainer:
             "final_session_sample_accuracy": float(self.final_accuracies[-1]),
             "PD": float(pd),
             "session_accuracies": self.session_accuracies,
+            "base_session_accuracies": self.base_session_accuracies,
             "final_acc_by_session": self.final_accuracies,
             "task_wise_accuracies": self.task_wise_accuracies,
         }
@@ -802,6 +809,7 @@ class PCASFSCILTrainer:
                 "base_student_prototypes": self.base_prototypes.cpu(),
                 "all_prototypes": self.all_prototypes.cpu(),
                 "session_accuracies": self.session_accuracies,
+                "base_session_accuracies": self.base_session_accuracies,
                 "AA": summary["AA"],
                 "final_session_class_accuracy": summary["final_session_class_accuracy"],
                 "final_session_sample_accuracy": summary["final_session_sample_accuracy"],
