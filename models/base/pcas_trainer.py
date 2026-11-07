@@ -18,12 +18,8 @@ from .pcas_losses import (
     leave_one_out_prototype_loss,
     sample_affinity_consistency,
     prototype_affinity_consistency,
-    teen_calibrate,
-)
-from .pcas_metrics import (
     affinity_drift,
-    mean_prototype_distance,
-    routing_diversity,
+    teen_calibrate,
 )
 
 
@@ -232,6 +228,7 @@ class PCASFSCILTrainer:
         # Macro class accuracy is retained for AA/PD. These histories add the
         # standard FSCIL cumulative and task-wise session accuracy report.
         self.session_accuracies = []
+        self.base_session_accuracies = []
         self.final_accuracies = []
         self.task_wise_accuracies = []
         self.results = []
@@ -275,9 +272,7 @@ class PCASFSCILTrainer:
         ])
 
     @torch.no_grad()
-    def _extract_features(
-        self, dataset, teacher=False, batch_size=None, return_routing=False
-    ):
+    def _extract_features(self, dataset, teacher=False, batch_size=None):
         original_transform = dataset.transform
         was_training = self.model.training
         dataset.transform = self._make_eval_transform(dataset)
@@ -291,25 +286,16 @@ class PCASFSCILTrainer:
             batch_size or int(getattr(self.args, "test_batch_size", 128)),
             shuffle=False,
         )
-        features, labels, indices, routing = [], [], [], []
+        features, labels, indices = [], [], []
         self.model.eval()
         try:
             for images, target, index in tqdm(loader, desc="Extract features"):
                 images = images.to(self.device, non_blocking=True)
-                if teacher:
-                    output = self.model.encode_teacher(images)
-                    route_weights = None
-                elif return_routing:
-                    output, auxiliary = self.model.encode_student(
-                        images, return_aux=True
-                    )
-                    route_weights = auxiliary["routing_weights"]
-                else:
-                    output = self.model.encode_student(images)
-                    route_weights = None
+                output = (
+                    self.model.encode_teacher(images)
+                    if teacher else self.model.encode_student(images)
+                )
                 features.append(output.cpu())
-                if route_weights is not None:
-                    routing.append(route_weights.cpu())
                 labels.append(torch.as_tensor(target).long().cpu())
                 indices.append(torch.as_tensor(index).long().cpu())
         finally:
@@ -318,17 +304,11 @@ class PCASFSCILTrainer:
             # the caller's mode so prompt dropout remains active during base
             # optimization and frozen modules stay in eval mode incrementally.
             self.model.train(was_training)
-        result = (
+        return (
             torch.cat(features).to(self.device),
             torch.cat(labels).to(self.device),
             torch.cat(indices).to(self.device),
         )
-        if return_routing:
-            route_tensor = (
-                torch.cat(routing).to(self.device) if routing else None
-            )
-            return result + (route_tensor,)
-        return result
 
     @torch.no_grad()
     def _cache_prototypes(self, dataset, num_classes, teacher=False):
@@ -380,13 +360,14 @@ class PCASFSCILTrainer:
             sampler.set_epoch(epoch)
             self.model.train()
             totals = {"total": 0.0, "ce": 0.0, "proto": 0.0,
-                      "sample_aff": 0.0, "proto_aff": 0.0}
-            warmup_epochs = int(getattr(self.args, "affinity_warmup_epochs", 10))
-            warmup_progress = (
-                1.0 if warmup_epochs <= 0
-                else min(1.0, float(epoch + 1) / float(warmup_epochs))
-            )
+                      "sample_aff": 0.0, "proto_aff": 0.0,
+                      "lambda_affinity": 0.0}
             num_batches = 0
+            routing_usage = torch.zeros(
+                self.model.pcas.num_components, device=self.device
+            )
+            routing_entropy_total = 0.0
+            routing_batches = 0
 
             # Refresh deterministic student prototype cache once per epoch.
             student_cache = self._cache_prototypes(
@@ -427,16 +408,35 @@ class PCASFSCILTrainer:
                 )
 
                 lambda_proto = float(getattr(self.args, "lambda_proto", 0.5))
-                lambda_aff_target = float(
-                    getattr(self.args, "lambda_affinity", 0.1)
+                lambda_aff_max = float(getattr(self.args, "lambda_affinity", 0.1))
+                warmup_epochs = int(getattr(self.args, "affinity_warmup_epochs", 10))
+                if warmup_epochs < 0:
+                    raise ValueError("affinity_warmup_epochs cannot be negative.")
+                # Linear warm-up is defined in epoch space and reaches the
+                # configured coefficient exactly at the end of warm-up.
+                warmup_factor = (
+                    1.0 if warmup_epochs == 0
+                    else min(1.0, float(epoch + 1) / warmup_epochs)
                 )
-                lambda_aff = lambda_aff_target * warmup_progress
+                lambda_aff = lambda_aff_max * warmup_factor
                 beta = float(getattr(self.args, "beta_affinity", 0.5))
-                loss = (
-                    loss_ce
-                    + lambda_proto * loss_proto
-                    + lambda_aff * (loss_sample + beta * loss_relation)
+
+                # Explicit loss switches support faithful component ablations
+                # without changing data, optimizer, or incremental protocol.
+                use_proto_loss = not bool(getattr(self.args, "disable_proto_loss", False))
+                use_sample_affinity = not bool(
+                    getattr(self.args, "disable_sample_affinity", False)
                 )
+                use_proto_affinity = not bool(
+                    getattr(self.args, "disable_proto_affinity", False)
+                )
+                loss = loss_ce
+                if use_proto_loss:
+                    loss = loss + lambda_proto * loss_proto
+                if use_sample_affinity:
+                    loss = loss + lambda_aff * loss_sample
+                if use_proto_affinity:
+                    loss = loss + lambda_aff * beta * loss_relation
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -447,18 +447,27 @@ class PCASFSCILTrainer:
                 totals["proto"] += float(loss_proto.detach())
                 totals["sample_aff"] += float(loss_sample.detach())
                 totals["proto_aff"] += float(loss_relation.detach())
+                totals["lambda_affinity"] += lambda_aff
                 num_batches += 1
 
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite PCAS training loss.")
 
                 if aux["routing_weights"] is not None:
+                    batch_routing = aux["routing_weights"].detach()
                     if not torch.allclose(
-                        aux["routing_weights"].sum(-1),
+                        batch_routing.sum(-1),
                         torch.ones(images.shape[0], device=self.device),
                         atol=1e-5,
                     ):
                         raise RuntimeError("PCAS routing weights do not sum to one.")
+                    routing_usage += batch_routing.mean(0)
+                    batch_entropy = -(
+                        batch_routing.clamp_min(1e-12)
+                        * batch_routing.clamp_min(1e-12).log()
+                    ).sum(-1).mean()
+                    routing_entropy_total += float(batch_entropy)
+                    routing_batches += 1
 
             scheduler.step()
             summary = {
@@ -468,9 +477,16 @@ class PCASFSCILTrainer:
             summary["epoch"] = epoch + 1
             summary["lr"] = scheduler.get_last_lr()[0]
             summary["lambda_affinity_effective"] = (
-                float(getattr(self.args, "lambda_affinity", 0.1))
-                * warmup_progress
+                summary.pop("lambda_affinity")
             )
+            if routing_batches:
+                mean_usage = routing_usage / routing_batches
+                usage_distribution = mean_usage / mean_usage.sum().clamp_min(1e-12)
+                summary["routing_entropy"] = routing_entropy_total / routing_batches
+                summary["routing_effective_components"] = float(
+                    torch.exp(-(usage_distribution * usage_distribution.clamp_min(1e-12).log()).sum())
+                )
+                summary["routing_component_usage"] = usage_distribution.cpu().tolist()
             self.results.append(summary)
             print("[PCAS]", summary)
 
@@ -498,10 +514,24 @@ class PCASFSCILTrainer:
 
     @torch.no_grad()
     def _evaluate(self, testset, seen_classes, all_prototypes, session):
-        features, labels, _, routing = self._extract_features(
-            testset, teacher=False, return_routing=True
-        )
+        features, labels, _ = self._extract_features(testset, teacher=False)
         validate_seen_class_coverage(labels, seen_classes, session)
+        affinity_drift_value = float("nan")
+        if self.base_teacher_prototypes is not None and self.base_prototypes is not None:
+            teacher_features, teacher_labels, _ = self._extract_features(
+                testset, teacher=True
+            )
+            if not torch.equal(labels, teacher_labels):
+                raise RuntimeError("Teacher/student evaluation labels are misaligned.")
+            affinity_drift_value = float(affinity_drift(
+                teacher_features,
+                features,
+                labels,
+                self.base_teacher_prototypes,
+                self.base_prototypes,
+                affinity_scale=float(getattr(self.args, "affinity_scale", 16.0)),
+                base_class_count=int(self.args.base_class),
+            ).item())
         logits = float(getattr(self.args, "pcas_logit_scale", 16.0)) * (
             features @ F.normalize(all_prototypes, dim=-1).t()
         )
@@ -537,39 +567,36 @@ class PCASFSCILTrainer:
             (predictions[novel_mask] == labels[novel_mask]).float().mean().item()
             if novel_mask.any() else float("nan")
         )
-        hmean = (
-            2.0 * base_acc * novel_acc / (base_acc + novel_acc)
-            if base_mask.any() and novel_mask.any() and (base_acc + novel_acc) > 0
-            else float("nan")
-        )
-        # TBR is the fraction of novel test samples predicted as a base class.
+        # TBR measures the fraction of novel examples absorbed by base classes.
         tbr = (
-            float(((predictions[novel_mask] < self.args.base_class).float().mean()).item())
+            ((predictions[novel_mask] < self.args.base_class).float().mean().item())
             if novel_mask.any() else float("nan")
         )
-        metrics = {
+        hmean = (
+            2.0 * base_acc * novel_acc / (base_acc + novel_acc + 1e-12)
+            if base_mask.any() and novel_mask.any() else float("nan")
+        )
+        # Mean within-class cosine distance on the evaluation split. This is a
+        # diagnostic only; it does not alter prototypes or classifier logits.
+        class_distances = []
+        for class_id in range(seen_classes):
+            mask = labels == class_id
+            class_center = F.normalize(features[mask].mean(0), dim=-1)
+            class_distances.append(
+                (1.0 - (features[mask] @ class_center)).mean()
+            )
+        prototype_distance = torch.stack(class_distances).mean().item()
+        return {
             "accuracy": accuracy,
             "class_average_accuracy": class_average_accuracy,
             "base_accuracy": base_acc,
             "novel_accuracy": novel_acc,
-            "base_novel_hmean": hmean,
-            "novel_to_base_error_rate": tbr,
+            "HMean": hmean,
+            "TBR": tbr,
+            "prototype_distance": prototype_distance,
+            "affinity_drift": affinity_drift_value,
             "task_wise_accuracy": task_wise_accuracy,
-            "mean_prototype_distance": mean_prototype_distance(
-                features, labels, all_prototypes[:seen_classes]
-            ),
         }
-        if routing is not None:
-            metrics.update(routing_diversity(routing))
-        if (
-            self.base_teacher_prototypes is not None
-            and self.base_prototypes is not None
-        ):
-            metrics["base_affinity_drift"] = affinity_drift(
-                self.base_teacher_prototypes, self.base_prototypes,
-                scale=float(getattr(self.args, "affinity_scale", 16.0)),
-            )
-        return metrics
 
     @torch.no_grad()
     def _incremental_session(self, trainset, testset, session):
@@ -658,6 +685,7 @@ class PCASFSCILTrainer:
         metrics.update({"session": session, "novel_classes": novel_classes.tolist()})
         self.results.append(metrics)
         self.session_accuracies.append(metrics["class_average_accuracy"])
+        self.base_session_accuracies.append(metrics["base_accuracy"])
         self.final_accuracies.append(metrics["accuracy"])
         self.task_wise_accuracies.append(metrics["task_wise_accuracy"])
         print("[PCAS incremental]", metrics)
@@ -715,6 +743,7 @@ class PCASFSCILTrainer:
         self.results.append(base_metrics)
         self.base_accuracy = base_metrics["accuracy"]
         self.session_accuracies.append(base_metrics["class_average_accuracy"])
+        self.base_session_accuracies.append(base_metrics["base_accuracy"])
         self.final_accuracies.append(base_metrics["accuracy"])
         self.task_wise_accuracies.append(base_metrics["task_wise_accuracy"])
         print("[PCAS base]", base_metrics)
@@ -729,9 +758,12 @@ class PCASFSCILTrainer:
             trainset, _, testloader = get_new_dataloader(self.args, session)
             self._incremental_session(trainset, testloader.dataset, session)
 
+        # Compare base-class accuracy at session 0 and the final session.
+        # Comparing macro accuracy across growing class populations conflates
+        # retention with the addition of new classes.
         pd = (
-            self.session_accuracies[0] - self.session_accuracies[-1]
-            if len(self.session_accuracies) > 1 else 0.0
+            self.base_session_accuracies[0] - self.base_session_accuracies[-1]
+            if len(self.base_session_accuracies) > 1 else 0.0
         )
         mean_session_accuracy = float(np.mean(self.session_accuracies))
         final_session_class_accuracy = float(self.session_accuracies[-1])
@@ -743,6 +775,7 @@ class PCASFSCILTrainer:
             "final_session_sample_accuracy": float(self.final_accuracies[-1]),
             "PD": float(pd),
             "session_accuracies": self.session_accuracies,
+            "base_session_accuracies": self.base_session_accuracies,
             "final_acc_by_session": self.final_accuracies,
             "task_wise_accuracies": self.task_wise_accuracies,
         }
@@ -776,6 +809,7 @@ class PCASFSCILTrainer:
                 "base_student_prototypes": self.base_prototypes.cpu(),
                 "all_prototypes": self.all_prototypes.cpu(),
                 "session_accuracies": self.session_accuracies,
+                "base_session_accuracies": self.base_session_accuracies,
                 "AA": summary["AA"],
                 "final_session_class_accuracy": summary["final_session_class_accuracy"],
                 "final_session_sample_accuracy": summary["final_session_sample_accuracy"],
