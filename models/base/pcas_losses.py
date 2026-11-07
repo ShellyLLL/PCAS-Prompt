@@ -157,6 +157,56 @@ def prototype_affinity_consistency(
     )
 
 
+
+def affinity_drift(
+    teacher_features,
+    student_features,
+    labels,
+    teacher_base_prototypes,
+    student_base_prototypes,
+    affinity_scale=16.0,
+    base_class_count=None,
+):
+    """Mean KL drift of sample-to-base-prototype affinity distributions.
+
+    Base samples exclude their own class from both distributions, matching
+    PCAC's training definition. Novel samples compare against every base
+    prototype, matching the base-reference role in TEEN calibration.
+    """
+    labels = labels.long()
+    if teacher_features.shape != student_features.shape:
+        raise ValueError("Teacher and student features must have identical shapes.")
+    if teacher_base_prototypes.shape != student_base_prototypes.shape:
+        raise ValueError("Teacher and student base prototype banks must match.")
+    if teacher_features.shape[0] != labels.numel():
+        raise ValueError("Affinity features and labels are not aligned.")
+    base_count = (
+        int(base_class_count)
+        if base_class_count is not None
+        else int(teacher_base_prototypes.shape[0])
+    )
+    if base_count != teacher_base_prototypes.shape[0]:
+        raise ValueError("base_class_count does not match prototype bank size.")
+
+    teacher_logits = teacher_features @ teacher_base_prototypes.t()
+    student_logits = student_features @ student_base_prototypes.t()
+    base_mask = labels < base_count
+    if base_mask.any():
+        row = torch.arange(labels.numel(), device=labels.device)[base_mask]
+        teacher_logits[row, labels[base_mask]] = -1e9
+        student_logits[row, labels[base_mask]] = -1e9
+
+    teacher_prob = F.softmax(
+        teacher_logits * float(affinity_scale), dim=-1
+    ).detach()
+    student_log_prob = F.log_softmax(
+        student_logits * float(affinity_scale), dim=-1
+    )
+    per_sample_kl = F.kl_div(
+        student_log_prob, teacher_prob, reduction="none"
+    ).sum(dim=-1)
+    return per_sample_kl.mean()
+
 def teen_calibrate(
     novel_prototypes,
     base_prototypes,
