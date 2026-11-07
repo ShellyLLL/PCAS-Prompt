@@ -10,9 +10,10 @@ The implementation follows the revised PCAS definition:
 
 - Frozen ImageNet-21K ViT-B/16, 224x224 input, 14x14 patch grid.
 - Spatial prompts are generated from block-6 patch features through a shared 96-channel bottleneck and four depthwise 3x3 component branches.
-- The CLS feature generates the query. Component-specific A and K vectors produce cosine-like routing scores, followed by a softmax over all four components.
+- The CLS feature generates the query as `LN(W_q h)`. Component-specific `sigmoid(A)` gates modulate the normalized query, which is cosine-matched with normalized keys `K`; a temperature-scaled softmax produces weights over all components.
+- The residual scale is parameterized as `gamma_max * sigmoid(rho)`, initialized to 0.1 and bounded above by 0.5.
 - Only patch tokens receive the residual spatial prompt. CLS is unchanged at the injection point and the token count remains 197.
-- Base training optimizes the spatial prompt and base classifier with CE, leave-one-out prototype CE, sample-prototype affinity KL, and batch class-prototype affinity KL.
+- Base training optimizes the spatial prompt and base classifier with CE, leave-one-out prototype CE, sample-prototype affinity KL, and batch class-prototype affinity KL. The combined affinity coefficient is linearly warmed up over the first 10 epochs by default.
 - Teacher features/prototypes come from the original frozen ViT. Student features/prototypes come from the final PCAS-enhanced ViT.
 - After base training, PCAS and the backbone are frozen. The base prototypes used by TEEN are recomputed from the final PCAS student feature space. Teacher prototypes are retained only for auditing and PCAC.
 - Each novel class prototype is computed from its K-shot support set and calibrated by TEEN against the frozen PCAS student base prototypes. No prompt fine-tuning, replay, or pseudo-incremental episodes are used.
@@ -103,7 +104,7 @@ Runs are saved under `checkpoint/PCAS/<dataset>/<timestamp>/`:
 - `pcas_final.pth`: model, all class prototypes, session accuracies and summary.
 - `results.txt`: per-epoch and per-session records.
 
-The summary reports mean session accuracy (AA_session_mean) and PD = base-session accuracy minus final-session accuracy. For paper reporting, also report per-class averaged accuracy and the exact metric convention used by the comparison methods.
+The summary reports mean session class-average accuracy (AA) and PD = base-session class-average accuracy minus final-session class-average accuracy. Each session also reports base/novel accuracy, their harmonic mean (HMean), novel-to-base error rate (TBR), mean cosine distance to the ground-truth class prototype, base-prototype affinity drift (teacher vs. final student), and routing usage/entropy diagnostics. TBR is the fraction of novel test examples predicted as base classes; it is not limited to semantically nearest base classes. Routing entropy is a usage diagnostic and should not be interpreted alone as proof that components are functionally distinct.
 
 ## Important limitations
 
