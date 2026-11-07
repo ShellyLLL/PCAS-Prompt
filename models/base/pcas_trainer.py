@@ -18,6 +18,7 @@ from .pcas_losses import (
     leave_one_out_prototype_loss,
     sample_affinity_consistency,
     prototype_affinity_consistency,
+    affinity_drift,
     teen_calibrate,
 )
 
@@ -514,6 +515,22 @@ class PCASFSCILTrainer:
     def _evaluate(self, testset, seen_classes, all_prototypes, session):
         features, labels, _ = self._extract_features(testset, teacher=False)
         validate_seen_class_coverage(labels, seen_classes, session)
+        affinity_drift_value = float("nan")
+        if self.base_teacher_prototypes is not None and self.base_prototypes is not None:
+            teacher_features, teacher_labels, _ = self._extract_features(
+                testset, teacher=True
+            )
+            if not torch.equal(labels, teacher_labels):
+                raise RuntimeError("Teacher/student evaluation labels are misaligned.")
+            affinity_drift_value = float(affinity_drift(
+                teacher_features,
+                features,
+                labels,
+                self.base_teacher_prototypes,
+                self.base_prototypes,
+                affinity_scale=float(getattr(self.args, "affinity_scale", 16.0)),
+                base_class_count=int(self.args.base_class),
+            ).item())
         logits = float(getattr(self.args, "pcas_logit_scale", 16.0)) * (
             features @ F.normalize(all_prototypes, dim=-1).t()
         )
@@ -576,6 +593,7 @@ class PCASFSCILTrainer:
             "HMean": hmean,
             "TBR": tbr,
             "prototype_distance": prototype_distance,
+            "affinity_drift": affinity_drift_value,
             "task_wise_accuracy": task_wise_accuracy,
         }
 
