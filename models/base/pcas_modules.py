@@ -40,8 +40,8 @@ class PCASPrompt(nn.Module):
     Query-Key attention follows the decomposed attention formulation in
     CODA-Prompt: query is modulated by a component-specific A vector and
     matched against a component-specific normalized key. Unlike CODA's
-    task-wise prompt allocation, PCAS uses a fixed four-component bank and
-    a softmax over all components.
+    task-wise prompt allocation, PCAS uses a fixed-capacity component bank
+    and a softmax over all components. The M=1 control removes the router.
     """
 
     def __init__(
@@ -52,6 +52,7 @@ class PCASPrompt(nn.Module):
         dropout: float = 0.1,
         route_temperature: float = 0.2,
         residual_init: float = 0.1,
+        residual_max: float = 0.5,
     ):
         super().__init__()
         if num_components < 1:
@@ -60,16 +61,18 @@ class PCASPrompt(nn.Module):
             raise ValueError("Embedding dimensions must be positive.")
         if route_temperature <= 0:
             raise ValueError("route_temperature must be positive.")
+        residual_max = float(residual_max)
+        residual_init = float(residual_init)
         if not 0.0 < residual_max <= 1.0:
             raise ValueError("residual_max must be in (0, 1].")
         if not 0.0 < residual_init < residual_max:
             raise ValueError("residual_init must be in (0, residual_max).")
 
-        self.embed_dim = embed_dim
-        self.bottleneck_dim = bottleneck_dim
-        self.num_components = num_components
+        self.embed_dim = int(embed_dim)
+        self.bottleneck_dim = int(bottleneck_dim)
+        self.num_components = int(num_components)
         self.route_temperature = float(route_temperature)
-        self.residual_max = float(residual_max)
+        self.residual_max = residual_max
 
         self.down = nn.Conv2d(embed_dim, bottleneck_dim, kernel_size=1, bias=False)
         if self.num_components > 1:
@@ -106,6 +109,26 @@ class PCASPrompt(nn.Module):
     def residual_scale(self) -> torch.Tensor:
         return self.residual_max * torch.sigmoid(self.gamma_logit)
 
+    def route(self, cls_feature: torch.Tensor) -> torch.Tensor:
+        """Return per-example soft assignments over the fixed component bank."""
+        if cls_feature.ndim != 2 or cls_feature.shape[-1] != self.embed_dim:
+            raise ValueError(
+                "Expected CLS features [B, embed_dim], got {}.".format(
+                    tuple(cls_feature.shape)
+                )
+            )
+        if self.num_components == 1:
+            return cls_feature.new_ones((cls_feature.shape[0], 1))
+
+        query = self.query_norm(self.query(cls_feature))
+        gates = torch.sigmoid(self.A)
+        modulated_query = F.normalize(
+            query.unsqueeze(1) * gates.unsqueeze(0), p=2, dim=-1
+        )
+        normalized_keys = F.normalize(self.K, p=2, dim=-1)
+        scores = torch.einsum("bmd,md->bm", modulated_query, normalized_keys)
+        return F.softmax(scores / self.route_temperature, dim=-1)
+
     def forward(
         self,
         patch_tokens: torch.Tensor,
@@ -116,6 +139,8 @@ class PCASPrompt(nn.Module):
             raise ValueError("Expected patch tokens [B,N,C] and CLS features [B,C].")
 
         batch_size, num_patches, channels = patch_tokens.shape
+        if cls_feature.shape[0] != batch_size:
+            raise ValueError("Patch-token and CLS batch sizes must match.")
         height, width = int(grid_size[0]), int(grid_size[1])
         if channels != self.embed_dim or num_patches != height * width:
             raise ValueError(
@@ -128,16 +153,7 @@ class PCASPrompt(nn.Module):
         )
         shared_map = self.down(patch_map)
 
-        if self.num_components == 1:
-            return cls_feature.new_ones((cls_feature.shape[0], 1))
-        query = self.query_norm(self.query(cls_feature))
-        gates = torch.sigmoid(self.A)
-        modulated_query = F.normalize(
-            query.unsqueeze(1) * gates.unsqueeze(0), p=2, dim=-1
-        )
-        normalized_keys = F.normalize(self.K, p=2, dim=-1)
-        scores = torch.einsum("bmd,md->bm", modulated_query, normalized_keys)
-        weights = F.softmax(scores / self.route_temperature, dim=-1)
+        weights = self.route(cls_feature)
 
         mixed_prompt = torch.zeros_like(patch_map)
         for component_index, component in enumerate(self.components):
