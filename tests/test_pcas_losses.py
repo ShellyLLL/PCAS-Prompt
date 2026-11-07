@@ -21,6 +21,7 @@ class PCASLossTests(unittest.TestCase):
             (self.teacher + 0.05 * torch.randn_like(self.teacher)).requires_grad_(),
             dim=-1,
         )
+        self.student.retain_grad()
         self.labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
 
     def test_prototype_cache_and_leave_one_out_loss(self):
