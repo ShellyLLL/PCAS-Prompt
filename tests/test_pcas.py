@@ -10,7 +10,12 @@ from models.base.pcas_losses import (
     teen_calibrate,
 )
 from models.base.pcas_modules import PCASPrompt
-from models.base.pcas_trainer import (\n    IndexedDataset,\n    compute_taskwise_accuracy,\n    validate_exact_shot_support,\n    validate_seen_class_coverage,\n)
+from models.base.pcas_trainer import (
+    IndexedDataset,
+    compute_taskwise_accuracy,
+    validate_exact_shot_support,
+    validate_seen_class_coverage,
+)
 
 
 class TestPCASLosses(unittest.TestCase):
