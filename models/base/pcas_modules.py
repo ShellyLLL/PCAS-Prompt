@@ -52,25 +52,38 @@ class PCASPrompt(nn.Module):
         dropout: float = 0.1,
         route_temperature: float = 0.2,
         residual_init: float = 0.1,
+        residual_max: float = 0.5,
+        dynamic_routing: bool = True,
     ):
         super().__init__()
-        if num_components < 2:
-            raise ValueError("PCAS requires at least two spatial components.")
+        if num_components < 1:
+            raise ValueError("PCAS requires at least one spatial component.")
         if bottleneck_dim <= 0 or embed_dim <= 0:
             raise ValueError("Embedding dimensions must be positive.")
         if route_temperature <= 0:
             raise ValueError("route_temperature must be positive.")
-        if not 0.0 < residual_init < 1.0:
-            raise ValueError("residual_init must be strictly between 0 and 1.")
+        if not 0.0 < residual_max <= 1.0:
+            raise ValueError("residual_max must be in (0, 1].")
+        if not 0.0 < residual_init < residual_max:
+            raise ValueError(
+                "residual_init must be strictly between 0 and residual_max."
+            )
 
         self.embed_dim = embed_dim
         self.bottleneck_dim = bottleneck_dim
         self.num_components = num_components
         self.route_temperature = float(route_temperature)
+        self.residual_max = float(residual_max)
+        # A one-component bank has no meaningful routing decision. Likewise,
+        # the routing ablation uses a fixed uniform mixture and freezes its
+        # otherwise-unused query/key parameters.
+        self.dynamic_routing = bool(dynamic_routing) and num_components > 1
 
         self.down = nn.Conv2d(embed_dim, bottleneck_dim, kernel_size=1, bias=False)
-        self.query_norm = nn.LayerNorm(embed_dim, eps=1e-6)
+        # The mathematical definition is q = LN(W_q h), so normalization is
+        # applied after projection, in the bottleneck/query space.
         self.query = nn.Linear(embed_dim, bottleneck_dim, bias=False)
+        self.query_norm = nn.LayerNorm(bottleneck_dim, eps=1e-6)
 
         # CODA-style decomposed attention parameters:
         # q_m = normalize(q * A_m), score_m = q_m dot normalize(K_m).
@@ -78,6 +91,11 @@ class PCASPrompt(nn.Module):
         self.K = nn.Parameter(torch.empty(num_components, bottleneck_dim))
         nn.init.orthogonal_(self.A)
         nn.init.orthogonal_(self.K)
+        if not self.dynamic_routing:
+            self.query.requires_grad_(False)
+            self.query_norm.requires_grad_(False)
+            self.A.requires_grad_(False)
+            self.K.requires_grad_(False)
 
         self.components = nn.ModuleList(
             [
@@ -87,7 +105,10 @@ class PCASPrompt(nn.Module):
         )
         self.output_norm = nn.LayerNorm(embed_dim, eps=1e-6)
 
-        residual_logit = math.log(residual_init / (1.0 - residual_init))
+        # Parameterize gamma in (0, residual_max], while preserving the
+        # requested initial residual magnitude exactly.
+        residual_ratio = residual_init / residual_max
+        residual_logit = math.log(residual_ratio / (1.0 - residual_ratio))
         self.gamma_logit = nn.Parameter(torch.tensor(residual_logit, dtype=torch.float32))
 
         nn.init.kaiming_normal_(self.down.weight, mode="fan_out", nonlinearity="linear")
@@ -95,7 +116,7 @@ class PCASPrompt(nn.Module):
 
     @property
     def residual_scale(self) -> torch.Tensor:
-        return torch.sigmoid(self.gamma_logit)
+        return self.residual_max * torch.sigmoid(self.gamma_logit)
 
     def forward(
         self,
@@ -119,14 +140,24 @@ class PCASPrompt(nn.Module):
         )
         shared_map = self.down(patch_map)
 
-        query = self.query(self.query_norm(cls_feature))
+        query = self.query_norm(self.query(cls_feature))
         query = F.normalize(query, p=2, dim=-1)
-        modulated_query = F.normalize(
-            query.unsqueeze(1) * self.A.unsqueeze(0), p=2, dim=-1
-        )
-        normalized_keys = F.normalize(self.K, p=2, dim=-1)
-        scores = torch.einsum("bmd,md->bm", modulated_query, normalized_keys)
-        weights = F.softmax(scores / self.route_temperature, dim=-1)
+        if self.dynamic_routing:
+            # PCAS definition: q_m = q * sigmoid(A_m), followed by cosine
+            # matching against the component-specific key K_m.
+            modulated_query = F.normalize(
+                query.unsqueeze(1) * torch.sigmoid(self.A).unsqueeze(0),
+                p=2,
+                dim=-1,
+            )
+            normalized_keys = F.normalize(self.K, p=2, dim=-1)
+            scores = torch.einsum("bmd,md->bm", modulated_query, normalized_keys)
+            weights = F.softmax(scores / self.route_temperature, dim=-1)
+        else:
+            weights = patch_tokens.new_full(
+                (batch_size, self.num_components),
+                1.0 / self.num_components,
+            )
 
         mixed_prompt = torch.zeros_like(patch_map)
         for component_index, component in enumerate(self.components):
@@ -190,6 +221,10 @@ class PCASViT(nn.Module):
             dropout=float(getattr(args, "prompt_dropout", 0.1)),
             route_temperature=float(getattr(args, "route_temperature", 0.2)),
             residual_init=float(getattr(args, "residual_init", 0.1)),
+            residual_max=float(getattr(args, "residual_max", 0.5)),
+            dynamic_routing=not bool(
+                getattr(args, "disable_dynamic_routing", False)
+            ),
         )
         self.fc = nn.Linear(self.embed_dim, int(args.base_class), bias=False)
         nn.init.normal_(self.fc.weight, mean=0.0, std=0.02)
