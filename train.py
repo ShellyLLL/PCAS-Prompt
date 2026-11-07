@@ -23,6 +23,9 @@ def get_command_line_parser():
     parser.add_argument('--prompt_dropout', type=float, default=0.1)
     parser.add_argument('--route_temperature', type=float, default=0.2)
     parser.add_argument('--residual_init', type=float, default=0.1)
+    parser.add_argument('--residual_max', type=float, default=0.5)
+    parser.add_argument('--affinity_warmup_epochs', type=int, default=10,
+                        help='Linear warm-up epochs for the PCAC affinity loss weight.')
     parser.add_argument('--classes_per_batch', type=int, default=16)
     parser.add_argument('--samples_per_class', type=int, default=4)
     parser.add_argument('--pcas_lr', type=float, default=1e-3)
