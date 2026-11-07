@@ -78,6 +78,19 @@ class ClassBalancedBatchSampler(Sampler):
             yield batch
 
 
+def normalized_path_identities(dataset):
+    """Return canonical sample paths when a dataset exposes path-based data."""
+    raw_data = getattr(dataset, "data", None)
+    if not isinstance(raw_data, (list, tuple)) or not raw_data:
+        return None
+    if not all(isinstance(path, (str, os.PathLike)) for path in raw_data):
+        return None
+    return [
+        os.path.realpath(os.path.expanduser(os.fspath(path)))
+        for path in raw_data
+    ]
+
+
 class IndexedDataset(torch.utils.data.Dataset):
     """Attach the local dataset position to a (image, label) sample.
 
@@ -332,20 +345,26 @@ class PCASFSCILTrainer:
 
     @torch.no_grad()
     def _cache_prototypes(self, dataset, num_classes, teacher=False):
-        features, labels, _ = self._extract_features(dataset, teacher=teacher)
+        features, labels, indices = self._extract_features(
+            dataset, teacher=teacher
+        )
+        expected_indices = torch.arange(len(dataset), device=self.device)
+        if not torch.equal(indices, expected_indices):
+            raise RuntimeError(
+                "Prototype-cache features are not aligned with local dataset indices."
+            )
         return build_prototype_cache(features, labels, num_classes)
 
     def _base_optimizer(self):
         prompt_params = [
-            p for p in self.model.pcas.parameters() if p.requires_grad
+            parameter for parameter in self.model.pcas.parameters()
+            if parameter.requires_grad
         ]
+        if not prompt_params:
+            raise RuntimeError("PCAS prompt bank has no trainable parameters.")
         return torch.optim.AdamW(
-            [
-                {"params": prompt_params,
-                 "lr": float(getattr(self.args, "pcas_lr", 1e-3))},
-                {"params": self.model.fc.parameters(),
-                 "lr": float(getattr(self.args, "pcas_head_lr", 1e-3))},
-            ],
+            prompt_params,
+            lr=float(getattr(self.args, "pcas_lr", 1e-3)),
             weight_decay=float(getattr(self.args, "pcas_weight_decay", 1e-4)),
         )
 
@@ -398,8 +417,8 @@ class PCASFSCILTrainer:
             for images, labels, indices in tqdm(
                 trainloader, desc=f"PCAS base epoch {epoch + 1}"
             ):
-                # batch_sampler emits a list of indices, default collate creates
-                # [1,B,...]; flatten only the sampler's singleton outer batch.
+                # The batch sampler yields B local indices; default collation
+                # returns images/labels/indices with the ordinary batch dimension.
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.long().to(self.device)
                 indices = indices.long().to(self.device)
@@ -410,7 +429,9 @@ class PCASFSCILTrainer:
                 student_features, aux = self.model.encode_student(
                     images, return_aux=True
                 )
-                logits = self.model.classify_base(student_features)
+                logits = self.model.classify_base(
+                    student_features, student_cache["prototypes"]
+                )
                 loss_ce = F.cross_entropy(logits, labels)
                 loss_proto = leave_one_out_prototype_loss(
                     student_features, labels, indices, student_cache,
@@ -438,8 +459,18 @@ class PCASFSCILTrainer:
                     + lambda_aff * (loss_sample + beta * loss_relation)
                 )
 
+                if not torch.isfinite(loss).all():
+                    raise FloatingPointError("Non-finite PCAS training loss.")
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                for group in optimizer.param_groups:
+                    for parameter in group["params"]:
+                        if parameter.grad is not None and not torch.isfinite(
+                            parameter.grad
+                        ).all():
+                            raise FloatingPointError(
+                                "Non-finite PCAS gradient; optimizer step aborted."
+                            )
                 optimizer.step()
 
                 totals["total"] += float(loss.detach())
@@ -448,9 +479,6 @@ class PCASFSCILTrainer:
                 totals["sample_aff"] += float(loss_sample.detach())
                 totals["proto_aff"] += float(loss_relation.detach())
                 num_batches += 1
-
-                if not torch.isfinite(loss):
-                    raise FloatingPointError("Non-finite PCAS training loss.")
 
                 if aux["routing_weights"] is not None:
                     if not torch.allclose(
@@ -586,40 +614,39 @@ class PCASFSCILTrainer:
                 .format(session, novel_classes.tolist(), expected_classes.tolist())
             )
 
-        if self.args.dataset == "cub200":
-            support_counts = validate_exact_shot_support(
-                trainset.targets, expected_classes, self.args.shot, session
-            )
-            support_paths = [
-                os.path.realpath(os.path.expanduser(str(path)))
-                for path in trainset.data
-            ]
-            test_paths = [
-                os.path.realpath(os.path.expanduser(str(path)))
-                for path in testset.data
-            ]
+        # All configured FSCIL datasets use the same K-shot session contract.
+        support_counts = validate_exact_shot_support(
+            trainset.targets, expected_classes, self.args.shot, session
+        )
+        support_audit = {
+            "dataset": self.args.dataset,
+            "session": session,
+            "shots_per_class": support_counts,
+            "support_images": len(trainset),
+        }
+        support_paths = normalized_path_identities(trainset)
+        test_paths = normalized_path_identities(testset)
+        if support_paths is not None:
             if len(set(support_paths)) != len(support_paths):
                 raise RuntimeError(
-                    "CUB session {} support split contains duplicate image paths."
+                    "Session {} support split contains duplicate image paths."
                     .format(session)
                 )
-            if len(set(test_paths)) != len(test_paths):
-                raise RuntimeError(
-                    "CUB session {} test split contains duplicate image paths."
-                    .format(session)
-                )
-            overlap = set(support_paths).intersection(test_paths)
-            if overlap:
-                raise RuntimeError(
-                    "CUB session {} has {} support/test image path overlaps."
-                    .format(session, len(overlap))
-                )
-            print("[PCAS CUB support audit]", {
-                "session": session,
-                "shots_per_class": support_counts,
-                "support_images": len(support_paths),
-                "support_test_overlap": len(overlap),
-            })
+            support_audit["support_path_count"] = len(support_paths)
+            if test_paths is not None:
+                if len(set(test_paths)) != len(test_paths):
+                    raise RuntimeError(
+                        "Session {} test split contains duplicate image paths."
+                        .format(session)
+                    )
+                overlap = set(support_paths).intersection(test_paths)
+                if overlap:
+                    raise RuntimeError(
+                        "Session {} has {} support/test image path overlaps."
+                        .format(session, len(overlap))
+                    )
+                support_audit["support_test_overlap"] = len(overlap)
+        print("[PCAS support audit]", support_audit)
 
         support_features, support_labels, _ = self._extract_features(
             trainset, teacher=False
@@ -673,30 +700,26 @@ class PCASFSCILTrainer:
     def train(self):
         start = time.time()
         trainset, trainloader, testloader = get_base_dataloader(self.args)
-        if self.args.dataset == "cub200":
-            train_paths = [
-                os.path.realpath(os.path.expanduser(str(path)))
-                for path in trainset.data
-            ]
-            test_paths = [
-                os.path.realpath(os.path.expanduser(str(path)))
-                for path in testloader.dataset.data
-            ]
+        train_paths = normalized_path_identities(trainset)
+        test_paths = normalized_path_identities(testloader.dataset)
+        if train_paths is not None:
             if len(set(train_paths)) != len(train_paths):
-                raise RuntimeError("CUB base training split contains duplicate image paths.")
-            if len(set(test_paths)) != len(test_paths):
-                raise RuntimeError("CUB base test split contains duplicate image paths.")
-            overlap = set(train_paths).intersection(test_paths)
-            if overlap:
-                raise RuntimeError(
-                    "CUB base train/test split has {} image path overlaps."
-                    .format(len(overlap))
-                )
-            print("[PCAS CUB base split audit]", {
-                "train_images": len(train_paths),
-                "test_images": len(test_paths),
-                "train_test_overlap": len(overlap),
-            })
+                raise RuntimeError("Base training split contains duplicate image paths.")
+            base_path_audit = {"train_images": len(train_paths)}
+            if test_paths is not None:
+                if len(set(test_paths)) != len(test_paths):
+                    raise RuntimeError("Base test split contains duplicate image paths.")
+                overlap = set(train_paths).intersection(test_paths)
+                if overlap:
+                    raise RuntimeError(
+                        "Base train/test split has {} image path overlaps."
+                        .format(len(overlap))
+                    )
+                base_path_audit.update({
+                    "test_images": len(test_paths),
+                    "train_test_overlap": len(overlap),
+                })
+            print("[PCAS base path audit]", base_path_audit)
         self._train_base(trainset, trainloader)
         self.all_prototypes = torch.zeros(
             int(self.args.num_classes),
