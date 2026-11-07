@@ -53,9 +53,7 @@ The default gamma_max is 0.5 and initialization gives gamma=0.1. The upper bound
 
 M is a **fixed model-capacity hyperparameter**, not the number of FSCIL sessions and not a dynamically growing expert count. M is selected before the final experiment and remains fixed from base training through the last incremental session.
 
-Candidate set: {1, 2, 4, 8, 16}. M=1 is mandatory as the single-generator control. For D=768 and bottleneck r, each additional component contributes D*r + 11*r + D parameters. The prompt bank parameter count is:
-
-P_prompt = 2*D*r + 2*r + 2*D + 1 + M*(D*r + 11*r + D).
+Candidate set: {1, 2, 4, 8, 16}. M=1 is mandatory as the single-generator control. For D=768 and bottleneck r, each spatial generator contributes D*r + 11*r + D parameters. For M>1, the shared query projection, query normalization, component gates, and keys add 2*D*r + 2*r + 2*M*r parameters, in addition to the shared down-projection, output normalization, and residual scalar. For M=1, the router is removed entirely: the single generator has a fixed weight of one and no unused Query/Key/Gate parameters. The selector records the actual trainable prompt parameter count from each instantiated model, so the M=1 control is compared honestly.
 
 Choose M by macro class accuracy on a stratified holdout taken only from the base training split. Exact ties prefer the smaller prompt parameter count, then smaller M. Do not choose M using novel-session or final test accuracy. Repeat selection across training seeds while keeping the validation split seed fixed; aggregate validation scores before fixing M. No dataset-specific optimal M is claimed before these experiments.
 

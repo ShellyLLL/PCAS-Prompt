@@ -72,15 +72,19 @@ class PCASPrompt(nn.Module):
         self.residual_max = float(residual_max)
 
         self.down = nn.Conv2d(embed_dim, bottleneck_dim, kernel_size=1, bias=False)
-        self.query = nn.Linear(embed_dim, bottleneck_dim, bias=False)
-        self.query_norm = nn.LayerNorm(bottleneck_dim, eps=1e-6)
-
-        # CODA-style decomposed attention parameters:
-        # q_m = normalize(q * A_m), score_m = q_m dot normalize(K_m).
-        self.A = nn.Parameter(torch.empty(num_components, bottleneck_dim))
-        self.K = nn.Parameter(torch.empty(num_components, bottleneck_dim))
-        nn.init.orthogonal_(self.A)
-        nn.init.orthogonal_(self.K)
+        if self.num_components > 1:
+            self.query = nn.Linear(embed_dim, bottleneck_dim, bias=False)
+            self.query_norm = nn.LayerNorm(bottleneck_dim, eps=1e-6)
+            self.A = nn.Parameter(torch.empty(num_components, bottleneck_dim))
+            self.K = nn.Parameter(torch.empty(num_components, bottleneck_dim))
+            nn.init.orthogonal_(self.A)
+            nn.init.orthogonal_(self.K)
+        else:
+            # M=1 is a true single-generator control with no inert router.
+            self.query = None
+            self.query_norm = None
+            self.register_parameter("A", None)
+            self.register_parameter("K", None)
 
         self.components = nn.ModuleList(
             [
@@ -123,6 +127,8 @@ class PCASPrompt(nn.Module):
         )
         shared_map = self.down(patch_map)
 
+        if self.num_components == 1:
+            return cls_feature.new_ones((cls_feature.shape[0], 1))
         query = self.query_norm(self.query(cls_feature))
         gates = torch.sigmoid(self.A)
         modulated_query = F.normalize(
