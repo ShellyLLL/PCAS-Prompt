@@ -151,6 +151,57 @@ def compute_taskwise_accuracy(labels, predictions, base_class, way, session):
     return task_accuracies
 
 
+def validate_exact_shot_support(labels, expected_classes, shots, session):
+    """Require exactly K unique support examples per expected class."""
+    labels = np.asarray(labels, dtype=np.int64)
+    expected_classes = np.asarray(expected_classes, dtype=np.int64)
+    if labels.ndim != 1 or expected_classes.ndim != 1:
+        raise ValueError("Support labels and expected classes must be 1-D.")
+    if int(shots) <= 0:
+        raise ValueError("The configured shot count must be positive.")
+    observed_classes = np.unique(labels)
+    if not np.array_equal(observed_classes, expected_classes):
+        raise RuntimeError(
+            "Session {} support classes are {}; expected {}."
+            .format(session, observed_classes.tolist(), expected_classes.tolist())
+        )
+    counts = np.asarray([(labels == cls).sum() for cls in expected_classes])
+    if np.any(counts != int(shots)):
+        details = {
+            int(cls): int(count)
+            for cls, count in zip(expected_classes, counts)
+        }
+        raise RuntimeError(
+            "Session {} is not a {}-shot support split; per-class counts: {}."
+            .format(session, int(shots), details)
+        )
+    return {
+        int(cls): int(count)
+        for cls, count in zip(expected_classes, counts)
+    }
+
+
+def validate_seen_class_coverage(labels, seen_classes, session):
+    """Require every seen global class to occur in the evaluation set."""
+    labels = torch.as_tensor(labels).long()
+    seen_classes = int(seen_classes)
+    if labels.ndim != 1 or labels.numel() == 0:
+        raise ValueError("Evaluation labels must be a non-empty 1-D tensor.")
+    if torch.any(labels < 0) or torch.any(labels >= seen_classes):
+        raise RuntimeError(
+            "Session {} test labels are outside [0, {})."
+            .format(session, seen_classes)
+        )
+    counts = torch.bincount(labels, minlength=seen_classes)
+    missing = torch.nonzero(counts == 0, as_tuple=False).flatten().tolist()
+    if missing:
+        raise RuntimeError(
+            "Session {} evaluation set is missing seen classes: {}."
+            .format(session, missing)
+        )
+    return counts
+
+
 class PCASFSCILTrainer:
     def __init__(self, args):
         self.args = set_up_datasets(args)
@@ -221,6 +272,7 @@ class PCASFSCILTrainer:
     @torch.no_grad()
     def _extract_features(self, dataset, teacher=False, batch_size=None):
         original_transform = dataset.transform
+        was_training = self.model.training
         dataset.transform = self._make_eval_transform(dataset)
         # All current dataset implementations return (image, label), while
         # feature extraction and the PCAS cache contract also need the stable
@@ -246,6 +298,10 @@ class PCASFSCILTrainer:
                 indices.append(torch.as_tensor(index).long().cpu())
         finally:
             dataset.transform = original_transform
+            # Feature extraction is a temporary eval-only operation. Restore
+            # the caller's mode so prompt dropout remains active during base
+            # optimization and frozen modules stay in eval mode incrementally.
+            self.model.train(was_training)
         return (
             torch.cat(features).to(self.device),
             torch.cat(labels).to(self.device),
@@ -409,6 +465,7 @@ class PCASFSCILTrainer:
     @torch.no_grad()
     def _evaluate(self, testset, seen_classes, all_prototypes, session):
         features, labels, _ = self._extract_features(testset, teacher=False)
+        validate_seen_class_coverage(labels, seen_classes, session)
         logits = float(getattr(self.args, "pcas_logit_scale", 16.0)) * (
             features @ F.normalize(all_prototypes, dim=-1).t()
         )
@@ -466,6 +523,42 @@ class PCASFSCILTrainer:
                 "Check this dataset's session_N.txt format and class ordering."
                 .format(session, novel_classes.tolist(), expected_classes.tolist())
             )
+
+        if self.args.dataset == "cub200":
+            support_counts = validate_exact_shot_support(
+                trainset.targets, expected_classes, self.args.shot, session
+            )
+            support_paths = [
+                os.path.realpath(os.path.expanduser(str(path)))
+                for path in trainset.data
+            ]
+            test_paths = [
+                os.path.realpath(os.path.expanduser(str(path)))
+                for path in testset.data
+            ]
+            if len(set(support_paths)) != len(support_paths):
+                raise RuntimeError(
+                    "CUB session {} support split contains duplicate image paths."
+                    .format(session)
+                )
+            if len(set(test_paths)) != len(test_paths):
+                raise RuntimeError(
+                    "CUB session {} test split contains duplicate image paths."
+                    .format(session)
+                )
+            overlap = set(support_paths).intersection(test_paths)
+            if overlap:
+                raise RuntimeError(
+                    "CUB session {} has {} support/test image path overlaps."
+                    .format(session, len(overlap))
+                )
+            print("[PCAS CUB support audit]", {
+                "session": session,
+                "shots_per_class": support_counts,
+                "support_images": len(support_paths),
+                "support_test_overlap": len(overlap),
+            })
+
         support_features, support_labels, _ = self._extract_features(
             trainset, teacher=False
         )
@@ -518,6 +611,30 @@ class PCASFSCILTrainer:
     def train(self):
         start = time.time()
         trainset, trainloader, testloader = get_base_dataloader(self.args)
+        if self.args.dataset == "cub200":
+            train_paths = [
+                os.path.realpath(os.path.expanduser(str(path)))
+                for path in trainset.data
+            ]
+            test_paths = [
+                os.path.realpath(os.path.expanduser(str(path)))
+                for path in testloader.dataset.data
+            ]
+            if len(set(train_paths)) != len(train_paths):
+                raise RuntimeError("CUB base training split contains duplicate image paths.")
+            if len(set(test_paths)) != len(test_paths):
+                raise RuntimeError("CUB base test split contains duplicate image paths.")
+            overlap = set(train_paths).intersection(test_paths)
+            if overlap:
+                raise RuntimeError(
+                    "CUB base train/test split has {} image path overlaps."
+                    .format(len(overlap))
+                )
+            print("[PCAS CUB base split audit]", {
+                "train_images": len(train_paths),
+                "test_images": len(test_paths),
+                "train_test_overlap": len(overlap),
+            })
         self._train_base(trainset, trainloader)
         self.all_prototypes = torch.zeros(
             int(self.args.num_classes),
@@ -554,15 +671,30 @@ class PCASFSCILTrainer:
             self.session_accuracies[0] - self.session_accuracies[-1]
             if len(self.session_accuracies) > 1 else 0.0
         )
+        mean_session_accuracy = float(np.mean(self.session_accuracies))
+        final_session_class_accuracy = float(self.session_accuracies[-1])
         summary = {
-            "AA": float(self.session_accuracies[-1]),
-            "mean_session_class_accuracy": float(np.mean(self.session_accuracies)),
+            # AA is the mean class-average accuracy over all evaluated sessions.
+            "AA": mean_session_accuracy,
+            "mean_session_class_accuracy": mean_session_accuracy,
+            "final_session_class_accuracy": final_session_class_accuracy,
+            "final_session_sample_accuracy": float(self.final_accuracies[-1]),
             "PD": float(pd),
             "session_accuracies": self.session_accuracies,
             "final_acc_by_session": self.final_accuracies,
             "task_wise_accuracies": self.task_wise_accuracies,
         }
         print("[PCAS summary]", summary)
+        print(
+            "AA (mean session class accuracy): {:.2f}".format(
+                mean_session_accuracy * 100.0
+            )
+        )
+        print(
+            "Final session class-average acc: {:.2f}".format(
+                final_session_class_accuracy * 100.0
+            )
+        )
         print(
             "Final acc: {}".format(
                 [round(value * 100.0, 2) for value in self.final_accuracies]
@@ -582,6 +714,9 @@ class PCASFSCILTrainer:
                 "base_student_prototypes": self.base_prototypes.cpu(),
                 "all_prototypes": self.all_prototypes.cpu(),
                 "session_accuracies": self.session_accuracies,
+                "AA": summary["AA"],
+                "final_session_class_accuracy": summary["final_session_class_accuracy"],
+                "final_session_sample_accuracy": summary["final_session_sample_accuracy"],
                 "final_acc_by_session": self.final_accuracies,
                 "task_wise_accuracies": self.task_wise_accuracies,
                 "summary": summary,
