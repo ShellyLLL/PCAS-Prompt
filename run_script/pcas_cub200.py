@@ -9,7 +9,7 @@ ARGS = [
     "--index_list_root", "/data/lx/fscil/data/index_list",
     "-gpu", "0",
     "-seed", "1",
-    "-epochs_base", "50",
+    "-epochs_base", "100",
     "-num_workers", "4",
     "-test_batch_size", "64",
     "--classes_per_batch", "16",
