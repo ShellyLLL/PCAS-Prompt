@@ -361,6 +361,11 @@ class PCASFSCILTrainer:
                       "sample_aff": 0.0, "proto_aff": 0.0,
                       "lambda_affinity": 0.0}
             num_batches = 0
+            routing_usage = torch.zeros(
+                self.model.pcas.num_components, device=self.device
+            )
+            routing_entropy_total = 0.0
+            routing_batches = 0
 
             # Refresh deterministic student prototype cache once per epoch.
             student_cache = self._cache_prototypes(
@@ -447,12 +452,20 @@ class PCASFSCILTrainer:
                     raise FloatingPointError("Non-finite PCAS training loss.")
 
                 if aux["routing_weights"] is not None:
+                    batch_routing = aux["routing_weights"].detach()
                     if not torch.allclose(
-                        aux["routing_weights"].sum(-1),
+                        batch_routing.sum(-1),
                         torch.ones(images.shape[0], device=self.device),
                         atol=1e-5,
                     ):
                         raise RuntimeError("PCAS routing weights do not sum to one.")
+                    routing_usage += batch_routing.mean(0)
+                    batch_entropy = -(
+                        batch_routing.clamp_min(1e-12)
+                        * batch_routing.clamp_min(1e-12).log()
+                    ).sum(-1).mean()
+                    routing_entropy_total += float(batch_entropy)
+                    routing_batches += 1
 
             scheduler.step()
             summary = {
@@ -464,6 +477,14 @@ class PCASFSCILTrainer:
             summary["lambda_affinity_effective"] = (
                 summary.pop("lambda_affinity")
             )
+            if routing_batches:
+                mean_usage = routing_usage / routing_batches
+                usage_distribution = mean_usage / mean_usage.sum().clamp_min(1e-12)
+                summary["routing_entropy"] = routing_entropy_total / routing_batches
+                summary["routing_effective_components"] = float(
+                    torch.exp(-(usage_distribution * usage_distribution.clamp_min(1e-12).log()).sum())
+                )
+                summary["routing_component_usage"] = usage_distribution.cpu().tolist()
             self.results.append(summary)
             print("[PCAS]", summary)
 
