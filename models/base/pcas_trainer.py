@@ -358,7 +358,8 @@ class PCASFSCILTrainer:
             sampler.set_epoch(epoch)
             self.model.train()
             totals = {"total": 0.0, "ce": 0.0, "proto": 0.0,
-                      "sample_aff": 0.0, "proto_aff": 0.0}
+                      "sample_aff": 0.0, "proto_aff": 0.0,
+                      "lambda_affinity": 0.0}
             num_batches = 0
 
             # Refresh deterministic student prototype cache once per epoch.
@@ -400,13 +401,35 @@ class PCASFSCILTrainer:
                 )
 
                 lambda_proto = float(getattr(self.args, "lambda_proto", 0.5))
-                lambda_aff = float(getattr(self.args, "lambda_affinity", 0.1))
-                beta = float(getattr(self.args, "beta_affinity", 0.5))
-                loss = (
-                    loss_ce
-                    + lambda_proto * loss_proto
-                    + lambda_aff * (loss_sample + beta * loss_relation)
+                lambda_aff_max = float(getattr(self.args, "lambda_affinity", 0.1))
+                warmup_epochs = int(getattr(self.args, "affinity_warmup_epochs", 10))
+                if warmup_epochs < 0:
+                    raise ValueError("affinity_warmup_epochs cannot be negative.")
+                # Linear warm-up is defined in epoch space and reaches the
+                # configured coefficient exactly at the end of warm-up.
+                warmup_factor = (
+                    1.0 if warmup_epochs == 0
+                    else min(1.0, float(epoch + 1) / warmup_epochs)
                 )
+                lambda_aff = lambda_aff_max * warmup_factor
+                beta = float(getattr(self.args, "beta_affinity", 0.5))
+
+                # Explicit loss switches support faithful component ablations
+                # without changing data, optimizer, or incremental protocol.
+                use_proto_loss = not bool(getattr(self.args, "disable_proto_loss", False))
+                use_sample_affinity = not bool(
+                    getattr(self.args, "disable_sample_affinity", False)
+                )
+                use_proto_affinity = not bool(
+                    getattr(self.args, "disable_proto_affinity", False)
+                )
+                loss = loss_ce
+                if use_proto_loss:
+                    loss = loss + lambda_proto * loss_proto
+                if use_sample_affinity:
+                    loss = loss + lambda_aff * loss_sample
+                if use_proto_affinity:
+                    loss = loss + lambda_aff * beta * loss_relation
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -417,6 +440,7 @@ class PCASFSCILTrainer:
                 totals["proto"] += float(loss_proto.detach())
                 totals["sample_aff"] += float(loss_sample.detach())
                 totals["proto_aff"] += float(loss_relation.detach())
+                totals["lambda_affinity"] += lambda_aff
                 num_batches += 1
 
                 if not torch.isfinite(loss):
@@ -437,6 +461,9 @@ class PCASFSCILTrainer:
             }
             summary["epoch"] = epoch + 1
             summary["lr"] = scheduler.get_last_lr()[0]
+            summary["lambda_affinity_effective"] = (
+                summary.pop("lambda_affinity")
+            )
             self.results.append(summary)
             print("[PCAS]", summary)
 
@@ -501,11 +528,33 @@ class PCASFSCILTrainer:
             (predictions[novel_mask] == labels[novel_mask]).float().mean().item()
             if novel_mask.any() else float("nan")
         )
+        # TBR measures the fraction of novel examples absorbed by base classes.
+        tbr = (
+            ((predictions[novel_mask] < self.args.base_class).float().mean().item())
+            if novel_mask.any() else float("nan")
+        )
+        hmean = (
+            2.0 * base_acc * novel_acc / (base_acc + novel_acc + 1e-12)
+            if base_mask.any() and novel_mask.any() else float("nan")
+        )
+        # Mean within-class cosine distance on the evaluation split. This is a
+        # diagnostic only; it does not alter prototypes or classifier logits.
+        class_distances = []
+        for class_id in range(seen_classes):
+            mask = labels == class_id
+            class_center = F.normalize(features[mask].mean(0), dim=-1)
+            class_distances.append(
+                (1.0 - (features[mask] @ class_center)).mean()
+            )
+        prototype_distance = torch.stack(class_distances).mean().item()
         return {
             "accuracy": accuracy,
             "class_average_accuracy": class_average_accuracy,
             "base_accuracy": base_acc,
             "novel_accuracy": novel_acc,
+            "HMean": hmean,
+            "TBR": tbr,
+            "prototype_distance": prototype_distance,
             "task_wise_accuracy": task_wise_accuracy,
         }
 
