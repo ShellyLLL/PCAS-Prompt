@@ -20,6 +20,11 @@ from .pcas_losses import (
     prototype_affinity_consistency,
     teen_calibrate,
 )
+from .pcas_metrics import (
+    affinity_drift,
+    mean_prototype_distance,
+    routing_diversity,
+)
 
 
 class ClassBalancedBatchSampler(Sampler):
@@ -270,7 +275,9 @@ class PCASFSCILTrainer:
         ])
 
     @torch.no_grad()
-    def _extract_features(self, dataset, teacher=False, batch_size=None):
+    def _extract_features(
+        self, dataset, teacher=False, batch_size=None, return_routing=False
+    ):
         original_transform = dataset.transform
         was_training = self.model.training
         dataset.transform = self._make_eval_transform(dataset)
@@ -284,16 +291,25 @@ class PCASFSCILTrainer:
             batch_size or int(getattr(self.args, "test_batch_size", 128)),
             shuffle=False,
         )
-        features, labels, indices = [], [], []
+        features, labels, indices, routing = [], [], [], []
         self.model.eval()
         try:
             for images, target, index in tqdm(loader, desc="Extract features"):
                 images = images.to(self.device, non_blocking=True)
-                output = (
-                    self.model.encode_teacher(images)
-                    if teacher else self.model.encode_student(images)
-                )
+                if teacher:
+                    output = self.model.encode_teacher(images)
+                    route_weights = None
+                elif return_routing:
+                    output, auxiliary = self.model.encode_student(
+                        images, return_aux=True
+                    )
+                    route_weights = auxiliary["routing_weights"]
+                else:
+                    output = self.model.encode_student(images)
+                    route_weights = None
                 features.append(output.cpu())
+                if route_weights is not None:
+                    routing.append(route_weights.cpu())
                 labels.append(torch.as_tensor(target).long().cpu())
                 indices.append(torch.as_tensor(index).long().cpu())
         finally:
@@ -302,11 +318,17 @@ class PCASFSCILTrainer:
             # the caller's mode so prompt dropout remains active during base
             # optimization and frozen modules stay in eval mode incrementally.
             self.model.train(was_training)
-        return (
+        result = (
             torch.cat(features).to(self.device),
             torch.cat(labels).to(self.device),
             torch.cat(indices).to(self.device),
         )
+        if return_routing:
+            route_tensor = (
+                torch.cat(routing).to(self.device) if routing else None
+            )
+            return result + (route_tensor,)
+        return result
 
     @torch.no_grad()
     def _cache_prototypes(self, dataset, num_classes, teacher=False):
@@ -359,6 +381,11 @@ class PCASFSCILTrainer:
             self.model.train()
             totals = {"total": 0.0, "ce": 0.0, "proto": 0.0,
                       "sample_aff": 0.0, "proto_aff": 0.0}
+            warmup_epochs = int(getattr(self.args, "affinity_warmup_epochs", 10))
+            warmup_progress = (
+                1.0 if warmup_epochs <= 0
+                else min(1.0, float(epoch + 1) / float(warmup_epochs))
+            )
             num_batches = 0
 
             # Refresh deterministic student prototype cache once per epoch.
@@ -400,7 +427,10 @@ class PCASFSCILTrainer:
                 )
 
                 lambda_proto = float(getattr(self.args, "lambda_proto", 0.5))
-                lambda_aff = float(getattr(self.args, "lambda_affinity", 0.1))
+                lambda_aff_target = float(
+                    getattr(self.args, "lambda_affinity", 0.1)
+                )
+                lambda_aff = lambda_aff_target * warmup_progress
                 beta = float(getattr(self.args, "beta_affinity", 0.5))
                 loss = (
                     loss_ce
@@ -437,6 +467,10 @@ class PCASFSCILTrainer:
             }
             summary["epoch"] = epoch + 1
             summary["lr"] = scheduler.get_last_lr()[0]
+            summary["lambda_affinity_effective"] = (
+                float(getattr(self.args, "lambda_affinity", 0.1))
+                * warmup_progress
+            )
             self.results.append(summary)
             print("[PCAS]", summary)
 
@@ -464,7 +498,9 @@ class PCASFSCILTrainer:
 
     @torch.no_grad()
     def _evaluate(self, testset, seen_classes, all_prototypes, session):
-        features, labels, _ = self._extract_features(testset, teacher=False)
+        features, labels, _, routing = self._extract_features(
+            testset, teacher=False, return_routing=True
+        )
         validate_seen_class_coverage(labels, seen_classes, session)
         logits = float(getattr(self.args, "pcas_logit_scale", 16.0)) * (
             features @ F.normalize(all_prototypes, dim=-1).t()
@@ -501,13 +537,39 @@ class PCASFSCILTrainer:
             (predictions[novel_mask] == labels[novel_mask]).float().mean().item()
             if novel_mask.any() else float("nan")
         )
-        return {
+        hmean = (
+            2.0 * base_acc * novel_acc / (base_acc + novel_acc)
+            if base_mask.any() and novel_mask.any() and (base_acc + novel_acc) > 0
+            else float("nan")
+        )
+        # TBR is the fraction of novel test samples predicted as a base class.
+        tbr = (
+            float(((predictions[novel_mask] < self.args.base_class).float().mean()).item())
+            if novel_mask.any() else float("nan")
+        )
+        metrics = {
             "accuracy": accuracy,
             "class_average_accuracy": class_average_accuracy,
             "base_accuracy": base_acc,
             "novel_accuracy": novel_acc,
+            "base_novel_hmean": hmean,
+            "novel_to_base_error_rate": tbr,
             "task_wise_accuracy": task_wise_accuracy,
+            "mean_prototype_distance": mean_prototype_distance(
+                features, labels, all_prototypes[:seen_classes]
+            ),
         }
+        if routing is not None:
+            metrics.update(routing_diversity(routing))
+        if (
+            self.base_teacher_prototypes is not None
+            and self.base_prototypes is not None
+        ):
+            metrics["base_affinity_drift"] = affinity_drift(
+                self.base_teacher_prototypes, self.base_prototypes,
+                scale=float(getattr(self.args, "affinity_scale", 16.0)),
+            )
+        return metrics
 
     @torch.no_grad()
     def _incremental_session(self, trainset, testset, session):
