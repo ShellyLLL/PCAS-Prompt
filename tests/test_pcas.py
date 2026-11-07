@@ -10,7 +10,7 @@ from models.base.pcas_losses import (
     teen_calibrate,
 )
 from models.base.pcas_modules import PCASPrompt
-from models.base.pcas_trainer import IndexedDataset, compute_taskwise_accuracy
+from models.base.pcas_trainer import (\n    IndexedDataset,\n    compute_taskwise_accuracy,\n    validate_exact_shot_support,\n    validate_seen_class_coverage,\n)
 
 
 class TestPCASLosses(unittest.TestCase):
@@ -127,6 +127,32 @@ class TestTaskwiseAccuracy(unittest.TestCase):
             compute_taskwise_accuracy(
                 labels, predictions, base_class=4, way=2, session=2
             )
+
+
+class TestFSCILProtocolAudits(unittest.TestCase):
+    def test_accepts_exact_five_shot_support(self):
+        labels = [100] * 5 + [101] * 5 + [102] * 5
+        counts = validate_exact_shot_support(
+            labels, expected_classes=[100, 101, 102], shots=5, session=1
+        )
+        self.assertEqual(counts, {100: 5, 101: 5, 102: 5})
+
+    def test_rejects_support_with_more_than_five_images_per_class(self):
+        labels = [100] * 6 + [101] * 5
+        with self.assertRaisesRegex(RuntimeError, "not a 5-shot support split"):
+            validate_exact_shot_support(
+                labels, expected_classes=[100, 101], shots=5, session=1
+            )
+
+    def test_rejects_missing_test_class(self):
+        labels = torch.tensor([0, 0, 1, 1, 3, 3])
+        with self.assertRaisesRegex(RuntimeError, "missing seen classes"):
+            validate_seen_class_coverage(labels, seen_classes=4, session=1)
+
+    def test_accepts_complete_test_class_coverage(self):
+        labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
+        counts = validate_seen_class_coverage(labels, seen_classes=4, session=1)
+        self.assertEqual(counts.tolist(), [2, 2, 2, 2])
 
 
 if __name__ == "__main__":
