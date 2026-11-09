@@ -40,8 +40,8 @@ class PCASPrompt(nn.Module):
     Query-Key attention follows the decomposed attention formulation in
     CODA-Prompt: query is modulated by a component-specific A vector and
     matched against a component-specific normalized key. Unlike CODA's
-    task-wise prompt allocation, PCAS uses a fixed four-component bank and
-    a softmax over all components.
+    task-wise prompt allocation, PCAS uses a fixed-capacity component bank
+    and a softmax over all components. The M=1 control removes the router.
     """
 
     def __init__(
@@ -52,32 +52,42 @@ class PCASPrompt(nn.Module):
         dropout: float = 0.1,
         route_temperature: float = 0.2,
         residual_init: float = 0.1,
+        residual_max: float = 0.5,
     ):
         super().__init__()
-        if num_components < 2:
-            raise ValueError("PCAS requires at least two spatial components.")
+        if num_components < 1:
+            raise ValueError("num_components must be at least one.")
         if bottleneck_dim <= 0 or embed_dim <= 0:
             raise ValueError("Embedding dimensions must be positive.")
         if route_temperature <= 0:
             raise ValueError("route_temperature must be positive.")
-        if not 0.0 < residual_init < 1.0:
-            raise ValueError("residual_init must be strictly between 0 and 1.")
+        residual_max = float(residual_max)
+        residual_init = float(residual_init)
+        if not 0.0 < residual_max <= 1.0:
+            raise ValueError("residual_max must be in (0, 1].")
+        if not 0.0 < residual_init < residual_max:
+            raise ValueError("residual_init must be in (0, residual_max).")
 
-        self.embed_dim = embed_dim
-        self.bottleneck_dim = bottleneck_dim
-        self.num_components = num_components
+        self.embed_dim = int(embed_dim)
+        self.bottleneck_dim = int(bottleneck_dim)
+        self.num_components = int(num_components)
         self.route_temperature = float(route_temperature)
+        self.residual_max = residual_max
 
         self.down = nn.Conv2d(embed_dim, bottleneck_dim, kernel_size=1, bias=False)
-        self.query_norm = nn.LayerNorm(embed_dim, eps=1e-6)
-        self.query = nn.Linear(embed_dim, bottleneck_dim, bias=False)
-
-        # CODA-style decomposed attention parameters:
-        # q_m = normalize(q * A_m), score_m = q_m dot normalize(K_m).
-        self.A = nn.Parameter(torch.empty(num_components, bottleneck_dim))
-        self.K = nn.Parameter(torch.empty(num_components, bottleneck_dim))
-        nn.init.orthogonal_(self.A)
-        nn.init.orthogonal_(self.K)
+        if self.num_components > 1:
+            self.query = nn.Linear(embed_dim, bottleneck_dim, bias=False)
+            self.query_norm = nn.LayerNorm(bottleneck_dim, eps=1e-6)
+            self.A = nn.Parameter(torch.empty(num_components, bottleneck_dim))
+            self.K = nn.Parameter(torch.empty(num_components, bottleneck_dim))
+            nn.init.orthogonal_(self.A)
+            nn.init.orthogonal_(self.K)
+        else:
+            # M=1 is a true single-generator control with no inert router.
+            self.query = None
+            self.query_norm = None
+            self.register_parameter("A", None)
+            self.register_parameter("K", None)
 
         self.components = nn.ModuleList(
             [
@@ -87,15 +97,37 @@ class PCASPrompt(nn.Module):
         )
         self.output_norm = nn.LayerNorm(embed_dim, eps=1e-6)
 
-        residual_logit = math.log(residual_init / (1.0 - residual_init))
+        initial_fraction = float(residual_init) / self.residual_max
+        residual_logit = math.log(initial_fraction / (1.0 - initial_fraction))
         self.gamma_logit = nn.Parameter(torch.tensor(residual_logit, dtype=torch.float32))
 
         nn.init.kaiming_normal_(self.down.weight, mode="fan_out", nonlinearity="linear")
-        nn.init.xavier_uniform_(self.query.weight)
+        if self.query is not None:
+            nn.init.xavier_uniform_(self.query.weight)
 
     @property
     def residual_scale(self) -> torch.Tensor:
-        return torch.sigmoid(self.gamma_logit)
+        return self.residual_max * torch.sigmoid(self.gamma_logit)
+
+    def route(self, cls_feature: torch.Tensor) -> torch.Tensor:
+        """Return per-example soft assignments over the fixed component bank."""
+        if cls_feature.ndim != 2 or cls_feature.shape[-1] != self.embed_dim:
+            raise ValueError(
+                "Expected CLS features [B, embed_dim], got {}.".format(
+                    tuple(cls_feature.shape)
+                )
+            )
+        if self.num_components == 1:
+            return cls_feature.new_ones((cls_feature.shape[0], 1))
+
+        query = self.query_norm(self.query(cls_feature))
+        gates = torch.sigmoid(self.A)
+        modulated_query = F.normalize(
+            query.unsqueeze(1) * gates.unsqueeze(0), p=2, dim=-1
+        )
+        normalized_keys = F.normalize(self.K, p=2, dim=-1)
+        scores = torch.einsum("bmd,md->bm", modulated_query, normalized_keys)
+        return F.softmax(scores / self.route_temperature, dim=-1)
 
     def forward(
         self,
@@ -107,6 +139,8 @@ class PCASPrompt(nn.Module):
             raise ValueError("Expected patch tokens [B,N,C] and CLS features [B,C].")
 
         batch_size, num_patches, channels = patch_tokens.shape
+        if cls_feature.shape[0] != batch_size:
+            raise ValueError("Patch-token and CLS batch sizes must match.")
         height, width = int(grid_size[0]), int(grid_size[1])
         if channels != self.embed_dim or num_patches != height * width:
             raise ValueError(
@@ -119,14 +153,7 @@ class PCASPrompt(nn.Module):
         )
         shared_map = self.down(patch_map)
 
-        query = self.query(self.query_norm(cls_feature))
-        query = F.normalize(query, p=2, dim=-1)
-        modulated_query = F.normalize(
-            query.unsqueeze(1) * self.A.unsqueeze(0), p=2, dim=-1
-        )
-        normalized_keys = F.normalize(self.K, p=2, dim=-1)
-        scores = torch.einsum("bmd,md->bm", modulated_query, normalized_keys)
-        weights = F.softmax(scores / self.route_temperature, dim=-1)
+        weights = self.route(cls_feature)
 
         mixed_prompt = torch.zeros_like(patch_map)
         for component_index, component in enumerate(self.components):
@@ -190,9 +217,8 @@ class PCASViT(nn.Module):
             dropout=float(getattr(args, "prompt_dropout", 0.1)),
             route_temperature=float(getattr(args, "route_temperature", 0.2)),
             residual_init=float(getattr(args, "residual_init", 0.1)),
+            residual_max=float(getattr(args, "residual_max", 0.5)),
         )
-        self.fc = nn.Linear(self.embed_dim, int(args.base_class), bias=False)
-        nn.init.normal_(self.fc.weight, mean=0.0, std=0.02)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -200,7 +226,6 @@ class PCASViT(nn.Module):
         self.encoder.eval()
         if self._incremental_frozen:
             self.pcas.eval()
-            self.fc.eval()
         return self
 
     @torch.no_grad()
@@ -249,15 +274,20 @@ class PCASViT(nn.Module):
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         return self.encode_student(images, return_aux=False)
 
-    def classify_base(self, features: torch.Tensor) -> torch.Tensor:
-        normalized_weight = F.normalize(self.fc.weight, p=2, dim=-1)
-        return self.temperature * F.linear(features, normalized_weight)
+    def classify_base(
+        self, features: torch.Tensor, prototypes: torch.Tensor
+    ) -> torch.Tensor:
+        """Classify against the same feature-space prototypes used at test time."""
+        if prototypes.ndim != 2 or prototypes.shape[-1] != features.shape[-1]:
+            raise ValueError("Base prototypes must have shape [C, embed_dim].")
+        normalized_prototypes = F.normalize(prototypes, p=2, dim=-1)
+        return self.temperature * (features @ normalized_prototypes.t())
 
-    def forward(self, images: torch.Tensor):
+    def forward(self, images: torch.Tensor, prototypes: torch.Tensor):
         features, auxiliary = self.encode_student(images, return_aux=True)
         return {
             "features": features,
-            "logit": self.classify_base(features),
+            "logit": self.classify_base(features, prototypes),
             "routing": auxiliary["routing_weights"],
             "residual_scale": auxiliary["residual_scale"],
         }
@@ -266,7 +296,6 @@ class PCASViT(nn.Module):
         """Freeze PCAS and the base classifier before real FSCIL sessions."""
         self._incremental_frozen = True
         self.pcas.requires_grad_(False)
-        self.fc.requires_grad_(False)
         self.eval()
 
 
