@@ -124,8 +124,11 @@ def set_up_datasets(args):
     # Fail before model construction / pretrained-weight download if a required
     # incremental split is absent. Base-session class selection is class-index
     # based for all three supported datasets.
-    for session in range(1, args.sessions):
-        _session_index_path(args, session)
+    # Pseudo-FSCIL validation uses only official training images and must not
+    # read official test/session split files during hyperparameter selection.
+    if not bool(getattr(args, "validation_mode", False)):
+        for session in range(1, args.sessions):
+            _session_index_path(args, session)
 
     return args
 

@@ -12,6 +12,7 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from dataloader.data_utils import set_up_datasets, get_base_dataloader, get_new_dataloader
+from dataloader.pcas_validation import build_pseudo_fscil_validation
 from .pcas_modules import PCASViT
 from .pcas_losses import (
     build_prototype_cache,
@@ -699,9 +700,30 @@ class PCASFSCILTrainer:
 
     def train(self):
         start = time.time()
-        trainset, trainloader, testloader = get_base_dataloader(self.args)
+        validation_mode = bool(getattr(self.args, "validation_mode", False))
+        validation_manifest = None
+        if validation_mode:
+            trainset, base_query, validation_sessions, validation_manifest = (
+                build_pseudo_fscil_validation(
+                    self.args,
+                    validation_seed=int(getattr(self.args, "validation_seed", 2026)),
+                    base_query_fraction=float(
+                        getattr(self.args, "validation_base_query_fraction", 0.2)
+                    ),
+                )
+            )
+            trainloader = self._loader(
+                trainset, int(getattr(self.args, "batch_size_base", 64)), shuffle=True
+            )
+            testset_for_base = base_query
+            session_splits = validation_sessions
+            print("[PCAS validation split manifest]", validation_manifest)
+        else:
+            trainset, trainloader, testloader = get_base_dataloader(self.args)
+            testset_for_base = testloader.dataset
+            session_splits = None
         train_paths = normalized_path_identities(trainset)
-        test_paths = normalized_path_identities(testloader.dataset)
+        test_paths = normalized_path_identities(testset_for_base)
         if train_paths is not None:
             if len(set(train_paths)) != len(train_paths):
                 raise RuntimeError("Base training split contains duplicate image paths.")
@@ -731,7 +753,7 @@ class PCASFSCILTrainer:
 
         # Evaluate the base session using the final frozen student prototypes.
         base_metrics = self._evaluate(
-            testloader.dataset, self.args.base_class, self.all_prototypes,
+            testset_for_base, self.args.base_class, self.all_prototypes,
             session=0,
         )
         base_metrics.update({"session": 0})
@@ -749,8 +771,12 @@ class PCASFSCILTrainer:
         )
 
         for session in range(1, int(self.args.sessions)):
-            trainset, _, testloader = get_new_dataloader(self.args, session)
-            self._incremental_session(trainset, testloader.dataset, session)
+            if validation_mode:
+                support_set, query_set = session_splits[session - 1]
+            else:
+                support_set, _, testloader = get_new_dataloader(self.args, session)
+                query_set = testloader.dataset
+            self._incremental_session(support_set, query_set, session)
 
         pd = (
             self.session_accuracies[0] - self.session_accuracies[-1]
@@ -795,6 +821,8 @@ class PCASFSCILTrainer:
         self.results.append(summary)
         torch.save(
             {
+                "validation_mode": validation_mode,
+                "validation_manifest": validation_manifest,
                 "model": self.model.state_dict(),
                 "base_student_prototypes": self.base_prototypes.cpu(),
                 "all_prototypes": self.all_prototypes.cpu(),
@@ -812,4 +840,8 @@ class PCASFSCILTrainer:
         with open(os.path.join(self.save_dir, "results.txt"), "w") as handle:
             for row in self.results:
                 handle.write(repr(row) + "\n")
+        if validation_mode:
+            import json
+            with open(os.path.join(self.save_dir, "validation_manifest.json"), "w") as handle:
+                json.dump(validation_manifest, handle, indent=2)
         print(f"PCAS completed in {(time.time() - start) / 60:.2f} minutes.")

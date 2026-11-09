@@ -17,6 +17,12 @@ def get_command_line_parser():
     parser.add_argument('-out', type=str, default='PCAS')
     parser.add_argument('--index_list_root', type=str, default=None,
                         help='Session split root. Defaults to <dataroot>/index_list.')
+    parser.add_argument('--validation_mode', action='store_true',
+                        help='Run pseudo-FSCIL validation using official training data only.')
+    parser.add_argument('--validation_seed', type=int, default=2026,
+                        help='Fixed seed for pseudo-FSCIL class/sample partitioning.')
+    parser.add_argument('--validation_base_query_fraction', type=float, default=0.2,
+                        help='Fraction of pseudo-base training images reserved for validation queries.')
     parser.add_argument('--pcas_layer', type=int, default=6)
     parser.add_argument('--bottleneck_dim', type=int, default=96)
     parser.add_argument('--num_components', type=int, default=4)
