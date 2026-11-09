@@ -234,6 +234,8 @@ class PCASFSCILTrainer:
         self.model = PCASViT(self.args).to(self.device)
 
         self.output_root = getattr(args, "out", None) or "PCAS"
+        if bool(getattr(args, "validation_mode", False)):
+            self.output_root = self.output_root + "_validation"
         self.save_dir = os.path.join(
             "checkpoint", self.output_root, self.args.dataset,
             time.strftime("%Y%m%d_%H%M%S")
