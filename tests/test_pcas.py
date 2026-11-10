@@ -1,13 +1,13 @@
 import unittest
+
 import torch
 import torch.nn.functional as F
 
 from models.base.pcas_losses import (
-    build_prototype_cache,
-    leave_one_out_prototype_loss,
-    sample_affinity_consistency,
-    prototype_affinity_consistency,
-    teen_calibrate,
+    build_component_prototype_cache,
+    component_prototype_logits,
+    componentwise_prototype_calibration,
+    leave_one_out_component_prototype_loss,
 )
 from models.base.pcas_modules import PCASPrompt
 from models.base.pcas_trainer import (
@@ -18,61 +18,84 @@ from models.base.pcas_trainer import (
 )
 
 
-class TestPCASLosses(unittest.TestCase):
+class TestComponentPrototypeCalibration(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(7)
         self.labels = torch.tensor([0, 0, 1, 1, 2, 2])
-        self.features = F.normalize(torch.randn(6, 16), dim=-1)
-        self.cache = build_prototype_cache(self.features, self.labels, 3)
+        self.features = F.normalize(torch.randn(6, 4, 16), dim=-1)
+        self.cache = build_component_prototype_cache(self.features, self.labels, 3)
+        self.weights = torch.softmax(torch.randn(6, 4), dim=-1)
 
-    def test_prototype_cache_and_loo(self):
-        self.assertEqual(tuple(self.cache["prototypes"].shape), (3, 16))
-        loss = leave_one_out_prototype_loss(
-            self.features, self.labels, torch.arange(6), self.cache
-        )
-        self.assertTrue(torch.isfinite(loss))
+    def test_component_cache_shapes_and_normalization(self):
+        prototypes = self.cache["prototypes"]
+        self.assertEqual(tuple(prototypes.shape), (4, 3, 16))
+        self.assertTrue(torch.allclose(
+            prototypes.norm(dim=-1), torch.ones(4, 3), atol=1e-5
+        ))
 
-    def test_affinity_losses_are_finite_and_differentiable(self):
+    def test_component_leave_one_out_loss_is_differentiable(self):
         student = F.normalize(
-            (self.features + 0.02 * torch.randn_like(self.features)).requires_grad_(),
+            (self.features + 0.01 * torch.randn_like(self.features)).requires_grad_(),
             dim=-1,
         )
-        sample_loss = sample_affinity_consistency(
-            self.features, student, self.labels,
-            self.cache["prototypes"], F.normalize(student.detach().reshape(3, 2, 16).mean(1), dim=-1)
+        loss = leave_one_out_component_prototype_loss(
+            student, self.weights, self.labels, torch.arange(6), self.cache
         )
-        relation_loss = prototype_affinity_consistency(
-            self.features, student, self.labels
-        )
-        total = sample_loss + relation_loss
-        self.assertTrue(torch.isfinite(total))
-        total.backward()
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
         self.assertIsNotNone(student.grad_fn)
 
-    def test_teen_uses_common_feature_space(self):
-        base = F.normalize(torch.randn(4, 16), dim=-1)
-        novel = F.normalize(torch.randn(2, 16), dim=-1)
-        calibrated, weights = teen_calibrate(novel, base, alpha=0.5, tau=16)
-        self.assertEqual(tuple(calibrated.shape), (2, 16))
-        self.assertTrue(torch.allclose(weights.sum(-1), torch.ones(2), atol=1e-6))
-        self.assertTrue(torch.allclose(calibrated.norm(dim=-1), torch.ones(2), atol=1e-5))
+    def test_component_logits_use_weighted_component_similarity(self):
+        query = F.normalize(torch.randn(5, 4, 16), dim=-1)
+        weights = torch.softmax(torch.randn(5, 4), dim=-1)
+        prototypes = F.normalize(torch.randn(4, 7, 16), dim=-1)
+        logits = component_prototype_logits(query, weights, prototypes)
+        expected = (
+            torch.einsum("bmd,mcd->bmc", query, prototypes)
+            * weights.unsqueeze(-1)
+        ).sum(1) * 16.0
+        self.assertTrue(torch.allclose(logits, expected, atol=1e-6))
+
+    def test_calibration_is_componentwise_and_normalized(self):
+        novel = F.normalize(torch.randn(3, 4, 16), dim=-1)
+        base = F.normalize(torch.randn(4, 6, 16), dim=-1)
+        calibrated, weights, indices = componentwise_prototype_calibration(
+            novel, base, alpha=0.4, tau=12.0, top_r=3
+        )
+        self.assertEqual(tuple(calibrated.shape), (3, 4, 16))
+        self.assertEqual(tuple(weights.shape), (3, 4, 3))
+        self.assertEqual(tuple(indices.shape), (3, 4, 3))
+        self.assertTrue(torch.allclose(
+            calibrated.norm(dim=-1), torch.ones(3, 4), atol=1e-5
+        ))
+        self.assertTrue(torch.allclose(
+            weights.sum(-1), torch.ones(3, 4), atol=1e-6
+        ))
+
+    def test_rejects_mismatched_component_count(self):
+        with self.assertRaisesRegex(ValueError, "component counts"):
+            componentwise_prototype_calibration(
+                torch.randn(2, 3, 8), torch.randn(4, 5, 8)
+            )
 
 
-class TestPCASPrompt(unittest.TestCase):
-    def test_spatial_prompt_preserves_patch_shape_and_router(self):
+class TestSpatialPrompt(unittest.TestCase):
+    def test_prompt_returns_fused_and_isolated_component_maps(self):
         module = PCASPrompt(
             embed_dim=32, bottleneck_dim=8, num_components=4,
-            dropout=0.0, route_temperature=0.2,
+            dropout=0.0, attention_temperature=0.2,
         )
         patches = torch.randn(3, 16, 32, requires_grad=True)
         cls = torch.randn(3, 32)
-        enhanced, weights = module(patches, cls, (4, 4))
-        self.assertEqual(tuple(enhanced.shape), (3, 16, 32))
+        fused, isolated, weights = module(patches, cls, (4, 4))
+        self.assertEqual(tuple(fused.shape), (3, 16, 32))
+        self.assertEqual(tuple(isolated.shape), (3, 4, 16, 32))
+        self.assertEqual(tuple(weights.shape), (3, 4))
         self.assertTrue(torch.allclose(weights.sum(-1), torch.ones(3), atol=1e-6))
-        enhanced.square().mean().backward()
+        (fused.square().mean() + isolated.square().mean()).backward()
         self.assertIsNotNone(module.K.grad)
         self.assertIsNotNone(module.A.grad)
-
+        self.assertTrue(0.0 < float(module.residual_scale) < 0.5)
 
 
 class TestIndexedDataset(unittest.TestCase):
@@ -91,72 +114,39 @@ class TestIndexedDataset(unittest.TestCase):
             return torch.tensor([index]), index + 10, 1000 + index
 
     def test_two_field_dataset_gets_local_index(self):
-        wrapped = IndexedDataset(self.TwoFieldDataset())
-        image, label, index = wrapped[2]
+        image, label, index = IndexedDataset(self.TwoFieldDataset())[2]
         self.assertEqual(label, 12)
         self.assertEqual(index, 2)
 
-    def test_three_field_dataset_metadata_is_not_used_as_cache_index(self):
-        wrapped = IndexedDataset(self.ThreeFieldDataset())
-        image, label, index = wrapped[1]
+    def test_dataset_metadata_is_not_used_as_cache_index(self):
+        image, label, index = IndexedDataset(self.ThreeFieldDataset())[1]
         self.assertEqual(label, 11)
         self.assertEqual(index, 1)
 
 
-class TestTaskwiseAccuracy(unittest.TestCase):
-    def test_triangular_task_accuracy_by_global_class_ranges(self):
-        # Base task has 4 classes; each incremental task adds 2 classes.
+class TestFSCILProtocolAudits(unittest.TestCase):
+    def test_triangular_task_accuracy(self):
         labels = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
         predictions = torch.tensor([0, 1, 0, 3, 4, 4, 6, 7, 8, 0])
-        values = compute_taskwise_accuracy(
-            labels, predictions, base_class=4, way=2, session=2
-        )
+        values = compute_taskwise_accuracy(labels, predictions, 4, 2, 2)
         self.assertEqual(len(values), 3)
         self.assertAlmostEqual(values[0], 0.75)
         self.assertAlmostEqual(values[1], 0.50)
         self.assertAlmostEqual(values[2], 0.50)
 
-    def test_session_zero_contains_only_base_task(self):
-        labels = torch.tensor([0, 1, 2, 3])
-        predictions = torch.tensor([0, 1, 1, 3])
-        values = compute_taskwise_accuracy(
-            labels, predictions, base_class=4, way=2, session=0
-        )
-        self.assertEqual(len(values), 1)
-        self.assertAlmostEqual(values[0], 0.75)
-
-    def test_rejects_missing_task_samples(self):
-        labels = torch.tensor([0, 1, 2, 3, 4, 5])
-        predictions = labels.clone()
-        with self.assertRaisesRegex(ValueError, "No test samples found for task 2"):
-            compute_taskwise_accuracy(
-                labels, predictions, base_class=4, way=2, session=2
-            )
-
-
-class TestFSCILProtocolAudits(unittest.TestCase):
-    def test_accepts_exact_five_shot_support(self):
+    def test_exact_shot_support(self):
         labels = [100] * 5 + [101] * 5 + [102] * 5
-        counts = validate_exact_shot_support(
-            labels, expected_classes=[100, 101, 102], shots=5, session=1
-        )
+        counts = validate_exact_shot_support(labels, [100, 101, 102], 5, 1)
         self.assertEqual(counts, {100: 5, 101: 5, 102: 5})
 
-    def test_rejects_support_with_more_than_five_images_per_class(self):
-        labels = [100] * 6 + [101] * 5
+    def test_rejects_wrong_shot_count(self):
         with self.assertRaisesRegex(RuntimeError, "not a 5-shot support split"):
-            validate_exact_shot_support(
-                labels, expected_classes=[100, 101], shots=5, session=1
-            )
+            validate_exact_shot_support([100] * 6 + [101] * 5, [100, 101], 5, 1)
 
-    def test_rejects_missing_test_class(self):
-        labels = torch.tensor([0, 0, 1, 1, 3, 3])
-        with self.assertRaisesRegex(RuntimeError, "missing seen classes"):
-            validate_seen_class_coverage(labels, seen_classes=4, session=1)
-
-    def test_accepts_complete_test_class_coverage(self):
-        labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
-        counts = validate_seen_class_coverage(labels, seen_classes=4, session=1)
+    def test_seen_class_coverage(self):
+        counts = validate_seen_class_coverage(
+            torch.tensor([0, 0, 1, 1, 2, 2, 3, 3]), 4, 1
+        )
         self.assertEqual(counts.tolist(), [2, 2, 2, 2])
 
 
