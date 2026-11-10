@@ -1,3 +1,5 @@
+# PCAS-Prompt
+
 This repository implements PCAS-Prompt on top of the existing FSCIL data protocol. The ViT-B/16 backbone is frozen; a fixed-capacity decomposed spatial prompt is injected after transformer block 6 without adding tokens. All spatial components are composed before injection and the model emits exactly one final student feature per image.
 
 ## Method contract
