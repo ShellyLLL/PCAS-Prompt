@@ -3,131 +3,285 @@ import numpy as np
 import torch
 from dataloader.sampler import CategoriesSampler
 
+
 def _session_index_path(args, session):
+    """Resolve the original FSCIL split numbering (session 1 is base)."""
+    session = int(session)
+    if session < 0:
+        raise ValueError("FSCIL session index cannot be negative.")
+
     root = getattr(args, "index_list_root", None)
-    if not root:
-        root = os.path.join(getattr(args, "_configured_data_root", args.dataroot), "index_list")
+    if root:
+        root = os.path.abspath(os.path.expanduser(root))
+    else:
+        data_root = getattr(args, "_configured_data_root", args.dataroot)
+        root = os.path.join(
+            os.path.abspath(os.path.expanduser(data_root)), "index_list"
+        )
 
     dataset_dirs = {
-        "cub200": ["cub200"],
+        "cub200": ["cub200", "CUB200", "CUB_200_2011"],
         "cifar100": ["cifar100", "CIFAR100", "CIFAR_100"],
-        "mini_imagenet": ["mini_imagenet", "miniimagenet"],
-    }.get(args.dataset, [args.dataset])
-    filename = "session_{}.txt".format(session + 1)
+        "mini_imagenet": ["mini_imagenet", "miniimagenet", "MiniImageNet"],
+        "FGVCAircraft": ["FGVCAircraft", "fgvc-aircraft", "fgvc_aircraft"],
+        "iNF200": ["iNF200", "inf200", "iNF-200"],
+    }.get(args.dataset)
+    if dataset_dirs is None:
+        raise ValueError("Unsupported FSCIL dataset: {!r}".format(args.dataset))
+
+    # The original split convention numbers the base session as session_1.
+    # Thus the first incremental task (trainer session=1) uses session_2.txt.
+    split_number = session + 1
+    filename = "session_{}.txt".format(split_number)
     candidates = [os.path.join(root, name, filename) for name in dataset_dirs]
     for path in candidates:
         if os.path.isfile(path):
+            if os.path.getsize(path) == 0:
+                raise ValueError("FSCIL session split is empty: {}".format(path))
             return path
     raise FileNotFoundError(
-        "Missing FSCIL session split for dataset={!r}, session={}. Checked: {}. "
-        "Expected <index_list_root>/<dataset>/session_N.txt.".format(
-            args.dataset, session + 1, ", ".join(candidates)
+        "Missing FSCIL session split for dataset={!r}, trainer_session={}. "
+        "The expected split is session_{}.txt. Checked: {}".format(
+            args.dataset, session, split_number, ", ".join(candidates)
         )
     )
 
 
+def _has_files(directory, filenames):
+    return os.path.isdir(directory) and all(
+        os.path.isfile(os.path.join(directory, name)) for name in filenames
+    )
+
+
 def _resolve_data_roots(args):
-    """Resolve the user's shared data directory to each loader's expected root."""
+    """Resolve the configured data root against the exact paths used by loaders.
+
+    args.dataroot may be the shared data directory or the dataset directory
+    itself. args._configured_data_root is kept as the shared root so the
+    default index_list directory remains alongside the dataset directories.
+    """
     configured_root = os.path.abspath(os.path.expanduser(args.dataroot))
-    args._configured_data_root = configured_root
+    if not os.path.isdir(configured_root):
+        raise FileNotFoundError(
+            "Configured FSCIL data root does not exist: {}".format(configured_root)
+        )
+
+    root_name = os.path.basename(os.path.normpath(configured_root))
+
+    def cub_valid(loader_root):
+        base = os.path.join(loader_root, "CUB_200_2011")
+        return (
+            _has_files(base, [
+                "images.txt", "train_test_split.txt",
+                "image_class_labels.txt", "classes.txt",
+            ])
+            and os.path.isdir(os.path.join(base, "images"))
+        )
+
+    def cifar_valid(loader_root):
+        return _has_files(
+            os.path.join(loader_root, "cifar-100-python"),
+            ["train", "test", "meta"],
+        )
+
+    def mini_valid(loader_root):
+        base = os.path.join(loader_root, "miniimagenet")
+        image_dir = os.path.join(base, "images")
+        train_csv = (
+            os.path.isfile(os.path.join(base, "train.csv"))
+            or os.path.isfile(os.path.join(base, "split", "train.csv"))
+        )
+        test_csv = (
+            os.path.isfile(os.path.join(base, "test.csv"))
+            or os.path.isfile(os.path.join(base, "split", "test.csv"))
+        )
+        return os.path.isdir(image_dir) and train_csv and test_csv
+
+    def aircraft_valid(loader_root):
+        base = os.path.join(loader_root, "fgvc-aircraft-2013b", "data")
+        return (
+            _has_files(base, [
+                "variants.txt", "images_variant_train.txt",
+                "images_variant_test.txt",
+            ])
+            and os.path.isdir(os.path.join(base, "images"))
+        )
+
+    def inf200_valid(loader_root):
+        base = os.path.join(loader_root, "iNF200")
+        return (
+            os.path.isdir(os.path.join(base, "train_mini"))
+            and os.path.isdir(os.path.join(base, "val"))
+        )
 
     if args.dataset == "cub200":
-        candidates = [
-            configured_root,
-            os.path.join(configured_root, "CUB_200_2011"),
-        ]
-        required = os.path.join("CUB_200_2011", "images.txt")
-        for candidate in candidates:
-            if os.path.isfile(os.path.join(candidate, required)):
-                args.dataroot = candidate
-                return
-        raise FileNotFoundError(
-            "CUB-200 metadata not found. Expected "
-            "<dataroot>/CUB_200_2011/images.txt. Checked roots: {}"
-            .format(", ".join(candidates))
+        if root_name == "CUB_200_2011":
+            candidates = [
+                (os.path.dirname(configured_root), os.path.dirname(configured_root)),
+                (configured_root, os.path.dirname(configured_root)),
+            ]
+        else:
+            candidates = [
+                (configured_root, configured_root),
+                (os.path.join(configured_root, "CUB_200_2011"), configured_root),
+            ]
+        validator = cub_valid
+        expected = (
+            "<data_root>/CUB_200_2011/{images.txt, train_test_split.txt, "
+            "image_class_labels.txt, classes.txt, images/}"
         )
 
-    if args.dataset == "cifar100":
-        candidates = [
-            os.path.join(configured_root, "CIFAR_100"),
-            configured_root,
-            os.path.join(configured_root, "CIFAR100"),
-        ]
-        required = os.path.join("cifar-100-python", "train")
-        for candidate in candidates:
-            if os.path.isfile(os.path.join(candidate, required)):
-                args.dataroot = candidate
-                return
-        raise FileNotFoundError(
-            "CIFAR-100 pickle files not found. Expected "
-            "<dataroot>/CIFAR_100/cifar-100-python/train. Checked roots: {}"
-            .format(", ".join(candidates))
+    elif args.dataset == "cifar100":
+        if root_name in ("CIFAR_100", "CIFAR100"):
+            candidates = [
+                (configured_root, os.path.dirname(configured_root)),
+                (os.path.dirname(configured_root), os.path.dirname(configured_root)),
+            ]
+        elif root_name == "cifar-100-python":
+            parent = os.path.dirname(configured_root)
+            index_root = (
+                os.path.dirname(parent)
+                if os.path.basename(parent) in ("CIFAR_100", "CIFAR100")
+                else parent
+            )
+            candidates = [(parent, index_root)]
+        else:
+            candidates = [
+                (os.path.join(configured_root, "CIFAR_100"), configured_root),
+                (configured_root, configured_root),
+                (os.path.join(configured_root, "CIFAR100"), configured_root),
+            ]
+        validator = cifar_valid
+        expected = "<data_root>/cifar-100-python/{train, test, meta}"
+
+    elif args.dataset == "mini_imagenet":
+        if root_name == "miniimagenet":
+            candidates = [
+                (os.path.dirname(configured_root), os.path.dirname(configured_root)),
+                (configured_root, os.path.dirname(configured_root)),
+            ]
+        elif root_name == "images":
+            shared_root = os.path.dirname(os.path.dirname(configured_root))
+            candidates = [(shared_root, shared_root)]
+        else:
+            candidates = [
+                (configured_root, configured_root),
+                (os.path.join(configured_root, "miniimagenet"), configured_root),
+                (os.path.dirname(configured_root), os.path.dirname(configured_root)),
+            ]
+        validator = mini_valid
+        expected = (
+            "<data_root>/miniimagenet/images and train.csv/test.csv "
+            "(or miniimagenet/split/train.csv and test.csv)"
         )
 
-    if args.dataset == "mini_imagenet":
-        candidates = [
-            configured_root,
-            os.path.join(configured_root, "miniimagenet"),
-            os.path.dirname(configured_root),
-        ]
-        for candidate in candidates:
-            image_dir = os.path.join(candidate, "miniimagenet", "images")
-            if os.path.isdir(image_dir):
-                args.dataroot = candidate
-                return
-        raise FileNotFoundError(
-            "MiniImageNet images not found. Expected "
-            "<dataroot>/miniimagenet/images. Checked roots: {}"
-            .format(", ".join(candidates))
+    elif args.dataset == "FGVCAircraft":
+        if root_name == "fgvc-aircraft-2013b":
+            candidates = [
+                (os.path.dirname(configured_root), os.path.dirname(configured_root)),
+                (configured_root, os.path.dirname(configured_root)),
+            ]
+        elif root_name == "data" and os.path.basename(
+            os.path.dirname(configured_root)
+        ) == "fgvc-aircraft-2013b":
+            shared_root = os.path.dirname(os.path.dirname(configured_root))
+            candidates = [(shared_root, shared_root)]
+        else:
+            candidates = [
+                (configured_root, configured_root),
+                (os.path.join(configured_root, "fgvc-aircraft-2013b"), configured_root),
+            ]
+        validator = aircraft_valid
+        expected = (
+            "<data_root>/fgvc-aircraft-2013b/data/{variants.txt, "
+            "images_variant_train.txt, images_variant_test.txt, images/}"
         )
+
+    elif args.dataset == "iNF200":
+        if root_name == "iNF200":
+            candidates = [
+                (os.path.dirname(configured_root), os.path.dirname(configured_root)),
+                (configured_root, os.path.dirname(configured_root)),
+            ]
+        else:
+            candidates = [
+                (configured_root, configured_root),
+                (os.path.join(configured_root, "iNF200"), configured_root),
+            ]
+        validator = inf200_valid
+        expected = "<data_root>/iNF200/{train_mini/, val/}"
+
+    else:
+        raise ValueError("Unsupported FSCIL dataset: {!r}".format(args.dataset))
+
+    checked = []
+    for loader_root, index_root in candidates:
+        loader_root = os.path.abspath(loader_root)
+        checked.append(loader_root)
+        if validator(loader_root):
+            args.dataroot = loader_root
+            args._configured_data_root = os.path.abspath(index_root)
+            return
+
+    raise FileNotFoundError(
+        "Could not resolve dataset={!r} from dataroot={!r}. The loader requires "
+        "{}. Checked loader roots: {}".format(
+            args.dataset, configured_root, expected, ", ".join(checked)
+        )
+    )
 
 
 def set_up_datasets(args):
     _resolve_data_roots(args)
-    if args.dataset == 'cifar100':
+    if args.dataset == "cifar100":
         import dataloader.cifar100.cifar as Dataset
         args.base_class = 60
-        args.num_classes=100
+        args.num_classes = 100
         args.way = 5
         args.shot = 5
         args.sessions = 9
-    if args.dataset == 'cub200':
+    elif args.dataset == "cub200":
         import dataloader.cub200.cub200 as Dataset
         args.base_class = 100
         args.num_classes = 200
         args.way = 10
         args.shot = 5
         args.sessions = 11
-    if args.dataset == 'mini_imagenet':
+    elif args.dataset == "mini_imagenet":
         import dataloader.miniimagenet.miniimagenet as Dataset
         args.base_class = 60
-        args.num_classes=100
+        args.num_classes = 100
         args.way = 5
         args.shot = 5
         args.sessions = 9
-    if args.dataset == 'FGVCAircraft':  
+    elif args.dataset == "FGVCAircraft":
         import dataloader.FGVCAircraft.FGVCAircraft as Dataset
         args.base_class = 50
-        args.num_classes = 100  
+        args.num_classes = 100
         args.way = 5
         args.shot = 5
-        args.sessions = 11  
-    if args.dataset == 'iNF200':  
+        args.sessions = 11
+    elif args.dataset == "iNF200":
         import dataloader.iNF200.iNF200 as Dataset
         args.base_class = 100
-        args.num_classes = 200 
+        args.num_classes = 200
         args.way = 10
         args.shot = 5
-        args.sessions = 11 
-    args.Dataset=Dataset
+        args.sessions = 11
+    else:
+        raise ValueError("Unsupported FSCIL dataset: {!r}".format(args.dataset))
 
-    # Fail before model construction / pretrained-weight download if a required
-    # incremental split is absent. Base-session class selection is class-index
-    # based for all three supported datasets.
-    for session in range(1, args.sessions):
+    args.Dataset = Dataset
+
+    # CUB/CIFAR/MiniImageNet base training is selected by class ID, so their
+    # first consumed support file is session_2.txt. Aircraft/iNF200 base
+    # training is explicitly defined by session_1.txt.
+    first_indexed_session = 0 if args.dataset in ("FGVCAircraft", "iNF200") else 1
+    for session in range(first_indexed_session, args.sessions):
         _session_index_path(args, session)
 
     return args
+
 
 def get_dataloader(args,session):
     if session == 0:

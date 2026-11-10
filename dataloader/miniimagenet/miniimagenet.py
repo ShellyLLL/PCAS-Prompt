@@ -23,46 +23,82 @@ class MiniImageNet(Dataset):
         self.IMAGE_PATH = osp.join(self.root, "miniimagenet", "images")
         self.SPLIT_PATH = osp.join(self.root, "miniimagenet", "split")
 
-        csv_candidates = [
-            osp.join(self.root, "miniimagenet", setname + ".csv"),
-            osp.join(self.SPLIT_PATH, setname + ".csv"),
-        ]
-        csv_path = next((p for p in csv_candidates if osp.isfile(p)), None)
-        if csv_path is None:
-            raise FileNotFoundError(
-                "MiniImageNet {}.csv not found. Checked: {}".format(
-                    setname, ", ".join(csv_candidates)
+        def find_csv(split_name):
+            candidates = [
+                osp.join(self.root, "miniimagenet", split_name + ".csv"),
+                osp.join(self.SPLIT_PATH, split_name + ".csv"),
+            ]
+            path = next((candidate for candidate in candidates if osp.isfile(candidate)), None)
+            if path is None:
+                raise FileNotFoundError(
+                    "MiniImageNet {}.csv not found. Checked: {}".format(
+                        split_name, ", ".join(candidates)
+                    )
                 )
-            )
-        if not osp.isdir(self.IMAGE_PATH):
-            raise FileNotFoundError("MiniImageNet image directory not found: {}".format(self.IMAGE_PATH))
-        lines = [x.strip() for x in open(csv_path, "r", encoding="utf-8").readlines()][1:]
+            return path
 
+        train_csv = find_csv("train")
+        test_csv = find_csv("test")
+        if not osp.isdir(self.IMAGE_PATH):
+            raise FileNotFoundError(
+                "MiniImageNet image directory not found: {}".format(self.IMAGE_PATH)
+            )
+
+        def read_rows(csv_path):
+            with open(csv_path, "r", encoding="utf-8") as handle:
+                rows = [line.strip() for line in handle.readlines()][1:]
+            parsed = []
+            for line_number, line in enumerate(rows, start=2):
+                if not line:
+                    continue
+                fields = line.split(",")
+                if len(fields) != 2:
+                    raise ValueError(
+                        "Malformed MiniImageNet CSV row {} in {}: {!r}".format(
+                            line_number, csv_path, line
+                        )
+                    )
+                parsed.append((fields[0], fields[1]))
+            return parsed
+
+        train_rows = read_rows(train_csv)
+        test_rows = read_rows(test_csv)
+
+        # Use one global class-ID mapping for both splits. Training CSV order
+        # defines the FSCIL class order; test-only classes are appended in a
+        # deterministic order rather than being re-numbered by test CSV order.
+        self.class_wnids = []
+        for _, wnid in train_rows + test_rows:
+            if wnid not in self.class_wnids:
+                self.class_wnids.append(wnid)
+        self.class_to_idx = {
+            wnid: class_id for class_id, wnid in enumerate(self.class_wnids)
+        }
+
+        selected_rows = train_rows if train else test_rows
         self.data = []
         self.targets = []
         self.data2label = {}
-        lb = -1
-
-        self.wnids = []
-
-        for l in lines:
-            name, wnid = l.split(',')
+        for name, wnid in selected_rows:
+            if wnid not in self.class_to_idx:
+                raise RuntimeError(
+                    "MiniImageNet class {!r} has no global class ID.".format(wnid)
+                )
             path = osp.join(self.IMAGE_PATH, name)
-            if wnid not in self.wnids:
-                self.wnids.append(wnid)
-                lb += 1
+            if not osp.isfile(path):
+                raise FileNotFoundError(
+                    "MiniImageNet CSV references a missing image: {}".format(path)
+                )
+            label = self.class_to_idx[wnid]
             self.data.append(path)
-            self.targets.append(lb)
-            self.data2label[path] = lb
-        
-        # Class names are optional metadata. Do not depend on a developer-local
-        # absolute path for loading the dataset or running FSCIL experiments.
+            self.targets.append(label)
+            self.data2label[path] = label
+
+        # Class names are optional metadata; data loading does not depend on it.
         self.classes = self.mapping_clsidx_to_txt()
-        if self.classes:
-            self.wnids = [
-                self.classes.get(name, name) for name in self.wnids
-            ]
-        
+        self.wnids = [
+            self.classes.get(name, name) for name in self.class_wnids
+        ]
 
         if train:
             image_size = 224
@@ -135,15 +171,16 @@ class MiniImageNet(Dataset):
         return data_tmp, targets_tmp
 
     def SelectfromClasses(self, data, targets, index):
-        data_tmp = []
-        targets_tmp = []
-        for i in index:
-            ind_cl = np.where(i == targets)[0]
-            for j in ind_cl:
-                data_tmp.append(data[j])
-                targets_tmp.append(targets[j])
-
-        return data_tmp, targets_tmp
+        target_array = np.asarray(targets, dtype=np.int64)
+        selected_indices = np.flatnonzero(np.isin(target_array, np.asarray(index, dtype=np.int64)))
+        if selected_indices.size == 0:
+            raise RuntimeError(
+                "MiniImageNet class selection is empty for class IDs: {}"
+                .format(list(index))
+            )
+        selected_data = [data[position] for position in selected_indices]
+        selected_targets = target_array[selected_indices].tolist()
+        return selected_data, selected_targets
 
     def mapping_clsidx_to_txt(self):
         classes = {}

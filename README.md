@@ -26,53 +26,97 @@ The implementation follows the revised PCAS definition:
 - `models/base/ViT_Network.py`: compatibility import for the PCAS model.
 - `models/base/ViT_fscil_trainer.py`: compatibility import for the PCAS trainer.
 
-## Data preparation
+## Data preparation and path contract
 
-The loaders accept the shared dataset root used in the experiment server. For the layout shown in the project setup, use `/data/lx/fscil/data` as `-dataroot`. The resolver maps each dataset to its actual nested directory and reports a clear error if required files are missing. Session split files default to `<dataroot>/index_list`; `--index_list_root` can override this.
+The default shared data root is `/data/lx/fscil/data`, matching the repository's CUB launcher and original experiment configuration. Override it with `FSCIL_DATA_ROOT` or `-dataroot`. The loaders validate the actual files they consume before model construction; they do not silently fall back to another machine-specific directory.
+
+Expected layouts under `$FSCIL_DATA_ROOT`:
 
 ```text
 data/
+  CUB_200_2011/
+    CUB_200_2011/
+      images/
+      images.txt
+      train_test_split.txt
+      image_class_labels.txt
+      classes.txt
+  CIFAR_100/
+    cifar-100-python/
+      train
+      test
+      meta
+  miniimagenet/
+    images/
+    train.csv
+    test.csv
+    # train.csv/test.csv may instead be under miniimagenet/split/
+  fgvc-aircraft-2013b/
+    data/
+      images/
+      variants.txt
+      images_variant_train.txt
+      images_variant_test.txt
+  iNF200/
+    train_mini/
+    val/
   index_list/
-    cub200/session_1.txt ... session_11.txt
-    FGVCAircraft/session_1.txt ... session_11.txt
-    iNF200/session_1.txt ... session_11.txt
-    cifar100/session_1.txt ... session_9.txt
-    mini_imagenet/session_1.txt ... session_9.txt
+    cub200/
+      session_2.txt ... session_11.txt
+    cifar100/
+      session_2.txt ... session_9.txt
+    mini_imagenet/
+      session_2.txt ... session_9.txt
+    FGVCAircraft/
+      session_1.txt ... session_11.txt
+    iNF200/
+      session_1.txt ... session_11.txt
 ```
 
-The split files must follow the format expected by each original dataset loader. CUB base training uses all base-class train images; CUB and other novel sessions use the corresponding support split.
+The root resolver also accepts a `-dataroot` that points directly at a dataset directory (for example, `.../CUB_200_2011`, `.../CIFAR_100`, `.../miniimagenet`, `.../fgvc-aircraft-2013b`, or `.../iNF200`) and normalizes it to the root expected by that dataset's existing loader. If the session lists live elsewhere, set `--index_list_root` or `FSCIL_INDEX_LIST_ROOT`.
+
+**Session numbering follows the original loader protocol:** trainer session 1 (the first incremental task) reads `session_2.txt`. `session_1.txt` is the base-session split for FGVCAircraft and iNF200; CUB, CIFAR-100 and MiniImageNet select base classes directly and do not consume that file in base training. The split file contents must retain each loader's original format:
+
+- CUB-200: image paths resolvable to entries in `CUB_200_2011/images/`.
+- CIFAR-100: 25 training-array indices for each 5-way, 5-shot incremental task.
+- MiniImageNet: image filenames or relative paths resolvable through `miniimagenet/train.csv`.
+- FGVC-Aircraft: image IDs or paths resolvable through `fgvc-aircraft-2013b/data/images/`.
+- iNF200: paths in the form `train_mini/<class_folder>/<image_name>`.
+
+The setup checks all required session files before constructing the ViT. Incremental sessions additionally validate the expected global class IDs and exact 5-shot support count. The path-based datasets audit duplicate support/test paths and train/test overlap.
 
 ## Installation
 
-Use a PyTorch/torchvision build compatible with the selected CUDA runtime. Install the versions in `requirements.txt` and ensure the repository's `timm` dependency is available. Pretrained ViT-B/16 ImageNet-21K weights are loaded through the existing timm model registration; the first run may need network access or a locally cached pretrained checkpoint.
+Use a PyTorch/torchvision build compatible with the selected CUDA runtime. Install the versions in `requirements.txt` and ensure the repository's `timm` dependency is available. Pretrained ViT-B/16 ImageNet-21K weights are loaded through the repository's timm model registration. PyTorch Hub caches downloaded weights under its cache root (controlled by `TORCH_HOME`); set `TORCH_HOME` to a persistent cache directory on the experiment server. Use `--scratch` only when intentionally training without pretrained weights.
 
 ## Run
 
-Use the server's shared data directory for all three datasets:
+Use the server's shared data directory. The root can be overridden without editing source files:
 
 ```bash
-DATA_ROOT=/data/lx/fscil/data
+export FSCIL_DATA_ROOT=/data/lx/fscil/data
+export FSCIL_INDEX_LIST_ROOT="$FSCIL_DATA_ROOT/index_list"
 
 # CUB-200-2011
 python train.py -project base -dataset cub200 -vit \
-  -dataroot "$DATA_ROOT" -gpu 0 -seed 1 \
+  -dataroot "$FSCIL_DATA_ROOT" -gpu 0 -seed 1 \
   -epochs_base 50 -num_workers 4 -test_batch_size 64 \
   --classes_per_batch 16 --samples_per_class 4
 
 # CIFAR-100
 python train.py -project base -dataset cifar100 -vit \
-  -dataroot "$DATA_ROOT" -gpu 0 -seed 1 \
+  -dataroot "$FSCIL_DATA_ROOT" -gpu 0 -seed 1 \
   -epochs_base 50 -num_workers 4 -test_batch_size 64 \
   --classes_per_batch 16 --samples_per_class 4
 
 # MiniImageNet
 python train.py -project base -dataset mini_imagenet -vit \
-  -dataroot "$DATA_ROOT" -gpu 0 -seed 1 \
+  -dataroot "$FSCIL_DATA_ROOT" -gpu 0 -seed 1 \
   -epochs_base 50 -num_workers 4 -test_batch_size 64 \
   --classes_per_batch 16 --samples_per_class 4
 ```
 
-The default `--index_list_root` is `$DATA_ROOT/index_list`; pass it explicitly only when your session splits are stored elsewhere. Before constructing the model, setup checks that every incremental session file exists.
+The default `--index_list_root` is `$FSCIL_DATA_ROOT/index_list`; pass it explicitly only when your session splits are stored elsewhere. `train.py` also reads `FSCIL_DATA_ROOT` and `FSCIL_INDEX_LIST_ROOT` directly.
 
 
 Important PCAS defaults:
@@ -98,7 +142,7 @@ These are reproducible starting settings, not claimed dataset-wise optima.
 
 ## Outputs
 
-Runs are saved under `checkpoint/PCAS/<dataset>/<timestamp>/`:
+Runs are saved under `<repository_root>/checkpoint/PCAS/<dataset>/<timestamp>/`, independent of the shell's current working directory.
 
 - `pcas_base.pth`: final frozen PCAS model, final component-wise base prototypes, and global teacher/student prototypes for diagnostics.
 - `pcas_final.pth`: model, all component-wise class prototypes, session accuracies and summary.

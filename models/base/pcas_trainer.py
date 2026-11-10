@@ -218,9 +218,15 @@ class PCASFSCILTrainer:
         self.model = PCASViT(self.args).to(self.device)
 
         self.output_root = getattr(args, "out", None) or "PCAS"
+        self.repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        output_base = (
+            self.output_root if os.path.isabs(self.output_root)
+            else os.path.join(self.repo_root, "checkpoint", self.output_root)
+        )
         self.save_dir = os.path.join(
-            "checkpoint", self.output_root, self.args.dataset,
-            time.strftime("%Y%m%d_%H%M%S")
+            output_base, self.args.dataset, time.strftime("%Y%m%d_%H%M%S")
         )
         os.makedirs(self.save_dir, exist_ok=True)
 
@@ -550,10 +556,11 @@ class PCASFSCILTrainer:
                 .format(session, novel_classes.tolist(), expected_classes.tolist())
             )
 
-        if self.args.dataset == "cub200":
-            support_counts = validate_exact_shot_support(
-                trainset.targets, expected_classes, self.args.shot, session
-            )
+        support_counts = validate_exact_shot_support(
+            trainset.targets, expected_classes, self.args.shot, session
+        )
+        path_based_datasets = ("cub200", "mini_imagenet", "FGVCAircraft", "iNF200")
+        if self.args.dataset in path_based_datasets:
             support_paths = [
                 os.path.realpath(os.path.expanduser(str(path)))
                 for path in trainset.data
@@ -564,21 +571,22 @@ class PCASFSCILTrainer:
             ]
             if len(set(support_paths)) != len(support_paths):
                 raise RuntimeError(
-                    "CUB session {} support split contains duplicate image paths."
+                    "Session {} support split contains duplicate image paths."
                     .format(session)
                 )
             if len(set(test_paths)) != len(test_paths):
                 raise RuntimeError(
-                    "CUB session {} test split contains duplicate image paths."
+                    "Session {} test split contains duplicate image paths."
                     .format(session)
                 )
             overlap = set(support_paths).intersection(test_paths)
             if overlap:
                 raise RuntimeError(
-                    "CUB session {} has {} support/test image path overlaps."
+                    "Session {} has {} support/test image path overlaps."
                     .format(session, len(overlap))
                 )
-            print("[PCAS CUB support audit]", {
+            print("[PCAS support path audit]", {
+                "dataset": self.args.dataset,
                 "session": session,
                 "shots_per_class": support_counts,
                 "support_images": len(support_paths),
@@ -631,7 +639,8 @@ class PCASFSCILTrainer:
     def train(self):
         start = time.time()
         trainset, trainloader, testloader = get_base_dataloader(self.args)
-        if self.args.dataset == "cub200":
+        path_based_datasets = ("cub200", "mini_imagenet", "FGVCAircraft", "iNF200")
+        if self.args.dataset in path_based_datasets:
             train_paths = [
                 os.path.realpath(os.path.expanduser(str(path)))
                 for path in trainset.data
@@ -641,16 +650,16 @@ class PCASFSCILTrainer:
                 for path in testloader.dataset.data
             ]
             if len(set(train_paths)) != len(train_paths):
-                raise RuntimeError("CUB base training split contains duplicate image paths.")
+                raise RuntimeError("Base training split contains duplicate image paths.")
             if len(set(test_paths)) != len(test_paths):
-                raise RuntimeError("CUB base test split contains duplicate image paths.")
+                raise RuntimeError("Base test split contains duplicate image paths.")
             overlap = set(train_paths).intersection(test_paths)
             if overlap:
                 raise RuntimeError(
-                    "CUB base train/test split has {} image path overlaps."
-                    .format(len(overlap))
+                    "Base train/test split has {} image path overlaps.".format(len(overlap))
                 )
-            print("[PCAS CUB base split audit]", {
+            print("[PCAS base split audit]", {
+                "dataset": self.args.dataset,
                 "train_images": len(train_paths),
                 "test_images": len(test_paths),
                 "train_test_overlap": len(overlap),
