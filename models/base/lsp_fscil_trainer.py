@@ -110,6 +110,8 @@ class LSPPrototypeFSCILTrainer:
             os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         )
         output_root = getattr(args, "out", None) or "LGSP_LSP_Prototype"
+        if output_root == "PCAS":
+            output_root = "LGSP_LSP_Prototype"
         output_root = (
             output_root if os.path.isabs(output_root)
             else os.path.join(self.repo_root, "checkpoint", output_root)
