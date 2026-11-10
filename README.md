@@ -165,3 +165,25 @@ The summary reports mean session class-average accuracy (AA) and PD = base-sessi
 - Session split files and image datasets are not bundled in this repository; provide them locally.
 - The current implementation uses the original dataset loaders and their class/session definitions.
 - Full-scale CUDA experiments are required to validate performance claims. A successful code run does not imply an AA/PD improvement.
+
+
+## LGSP-LSP + Prototype-based FSCIL
+
+A separate implementation of the Local Spatial Prompting (LSP) branch from LGSP is available without replacing the existing PCAS baseline.
+
+- `models/base/lsp_modules.py`: 30 image-conditioned two-convolution RGB prompt generators; frozen ViT CLS Query; learned prompt Keys; cosine Top-10 selection and selected-score softmax weighting; residual addition to the normalized input image.
+- `models/base/lsp_losses.py`: normalized global class-mean prototypes and cosine prototype classification.
+- `models/base/lsp_fscil_trainer.py`: class-balanced episodic leave-one-out prototype training on base classes, followed by real K-shot prototype construction and append-only incremental sessions.
+- `tests/test_lsp_prototype.py`: prompt-pool shape/gradient, prototype classifier, and leave-one-out objective tests.
+
+The ViT-B/16 is frozen throughout. The LSP pool is trained only in the base session and frozen before real incremental sessions. Novel classes are represented by the normalized mean of their K support features in the same frozen LSP-enhanced feature space. Existing class prototypes are not modified.
+
+Run the new method with:
+
+```bash
+python train.py --method lsp_proto -project base -dataset cub200 -dataroot "$FSCIL_DATA_ROOT" \\
+  -gpu 0 -seed 1 -epochs_base 50 -num_workers 4 -test_batch_size 64 \\
+  --lsp_pool_size 30 --lsp_top_k 10 --lsp_lr 2e-4
+```
+
+The existing PCAS method remains the default (`--method pcas`). AA is the mean class-average accuracy across sessions; PD is base-session class-average accuracy minus final-session class-average accuracy. No performance improvement is claimed until full dataset/CUDA experiments are run.
