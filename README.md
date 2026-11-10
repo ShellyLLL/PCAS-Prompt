@@ -2,7 +2,7 @@
 
 Prototype-Calibrated Affinity-Consistent Spatial Prompt Learning for Few-Shot Class-Incremental Learning.
 
-This repository implements PCAS-Prompt on top of the existing LGSP-Prompt FSCIL data protocol. The ViT-B/16 backbone is frozen; a four-component decomposed spatial prompt is injected after transformer block 6 without adding tokens. The fixed spatial component bank is fused by image-conditioned attention. No experts, task routing, replay, or pseudo-incremental episodes are used.
+This repository implements PCAS-Prompt on top of the existing LGSP-Prompt FSCIL data protocol. The ViT-B/16 backbone is frozen; a four-component decomposed spatial prompt is injected after transformer block 6 without adding tokens. The fixed spatial component bank is fused by image-conditioned attention; all calibration and classification use visual features from the same frozen ViT.
 
 ## Method contract
 
@@ -10,13 +10,13 @@ The implementation follows the revised PCAS definition:
 
 - Frozen ImageNet-21K ViT-B/16, 224x224 input, 14x14 patch grid.
 - Spatial prompts are generated from block-6 patch features through a shared 96-channel bottleneck and four depthwise 3x3 component branches.
-- The CLS feature generates a query in the shared bottleneck space. Component-specific sigmoid gates modulate the normalized query, which is cosine-matched with normalized component keys; a temperature-scaled softmax produces image-conditioned component weights. These are fusion weights over a fixed component bank, not a class/task router.
+- The CLS feature generates a query in the shared bottleneck space. Component-specific sigmoid gates modulate the normalized query, which is cosine-matched with normalized component keys; a temperature-scaled softmax produces image-conditioned component weights. These weights fuse the fixed spatial components.
 - The residual scale is parameterized as `gamma_max * sigmoid(rho)`, initialized to 0.1 and bounded above by 0.5.
 - Only patch tokens receive the residual spatial prompt. CLS is unchanged at the injection point and the token count remains 197.
 - Base training optimizes the spatial prompt with leave-one-out component-prototype classification, sample-prototype affinity KL, and batch class-prototype affinity KL. The combined affinity coefficient is linearly warmed up over the first 10 epochs by default.
 - Teacher features/prototypes come from the original frozen ViT. Student features/prototypes come from the final PCAS-enhanced ViT.
 - After base training, PCAS and the backbone are frozen. Base-class prototypes are stored separately for every isolated spatial component in the final PCAS feature space. Teacher global features are used only for affinity-consistency training.
-- Each novel class has one prototype per spatial component, computed from its real K-shot support set. Each component is calibrated only against the corresponding component prototypes of base classes; the calibrated component prototypes are retained separately for final query-weighted component-similarity classification. No prompt fine-tuning, replay, or pseudo-incremental episodes are used.
+- Each novel class has one prototype per spatial component, computed from its real K-shot support set. Each component is calibrated only against the corresponding component prototypes of base classes; the calibrated component prototypes are retained separately for final query-weighted component-similarity classification. Prompt parameters remain frozen after base training.
 
 ## Repository layout
 
