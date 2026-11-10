@@ -37,10 +37,8 @@ class TestComponentPrototypeCalibration(unittest.TestCase):
         ))
 
     def test_component_leave_one_out_loss_is_differentiable(self):
-        student = F.normalize(
-            (self.features + 0.01 * torch.randn_like(self.features)).requires_grad_(),
-            dim=-1,
-        )
+        raw_student = (self.features + 0.01 * torch.randn_like(self.features)).requires_grad_()
+        student = F.normalize(raw_student, dim=-1)
         loss = leave_one_out_component_prototype_loss(
             student, self.weights, self.labels, torch.arange(6), self.cache
         )
@@ -76,10 +74,8 @@ class TestComponentPrototypeCalibration(unittest.TestCase):
         ))
 
     def test_unified_component_prototype_objective_supervises_each_branch(self):
-        student = F.normalize(
-            (self.features + 0.02 * torch.randn_like(self.features)).requires_grad_(),
-            dim=-1,
-        )
+        raw_student = (self.features + 0.02 * torch.randn_like(self.features)).requires_grad_()
+        student = F.normalize(raw_student, dim=-1)
         losses = leave_one_out_component_prototype_losses(
             student, self.weights, self.labels, torch.arange(6), self.cache
         )
@@ -87,16 +83,14 @@ class TestComponentPrototypeCalibration(unittest.TestCase):
         for value in losses.values():
             self.assertTrue(torch.isfinite(value))
         losses["total"].backward()
-        self.assertIsNotNone(student.grad)
-        self.assertGreater(float(student.grad.abs().sum()), 0.0)
+        self.assertIsNotNone(raw_student.grad)
+        self.assertGreater(float(raw_student.grad.abs().sum()), 0.0)
 
     def test_component_affinity_losses_match_component_feature_spaces(self):
         teacher = F.normalize(torch.randn(6, 16), dim=-1)
         teacher_prototypes = F.normalize(torch.randn(3, 16), dim=-1)
-        student = F.normalize(
-            (self.features + 0.01 * torch.randn_like(self.features)).requires_grad_(),
-            dim=-1,
-        )
+        raw_student = (self.features + 0.01 * torch.randn_like(self.features)).requires_grad_()
+        student = F.normalize(raw_student, dim=-1)
         sample_loss = component_sample_affinity_consistency(
             teacher, student, self.labels, teacher_prototypes,
             self.cache["prototypes"],
@@ -107,8 +101,8 @@ class TestComponentPrototypeCalibration(unittest.TestCase):
         total = sample_loss + relation_loss
         self.assertTrue(torch.isfinite(total))
         total.backward()
-        self.assertIsNotNone(student.grad)
-        self.assertGreater(float(student.grad.abs().sum()), 0.0)
+        self.assertIsNotNone(raw_student.grad)
+        self.assertGreater(float(raw_student.grad.abs().sum()), 0.0)
     def test_rejects_mismatched_component_count(self):
         with self.assertRaisesRegex(ValueError, "component counts"):
             componentwise_prototype_calibration(
