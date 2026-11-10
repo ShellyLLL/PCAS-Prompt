@@ -374,7 +374,7 @@ class LSPPrototypeFSCILTrainer:
         }, os.path.join(self.save_dir, "lsp_final.pth"))
         with open(os.path.join(self.save_dir, "results.txt"), "w") as handle:
             for record in self.results:
-                handle.write(repr(record) + "\\n")
+                handle.write(repr(record) + "\n")
         print("LGSP-LSP FSCIL completed in {:.2f} minutes.".format(
             (time.time() - start) / 60.0
         ))
