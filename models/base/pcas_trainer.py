@@ -15,10 +15,10 @@ from dataloader.data_utils import set_up_datasets, get_base_dataloader, get_new_
 from .pcas_modules import PCASViT
 from .pcas_losses import (
     build_prototype_cache,
-    sample_affinity_consistency,
-    prototype_affinity_consistency,
     build_component_prototype_cache,
-    leave_one_out_component_prototype_loss,
+    leave_one_out_component_prototype_losses,
+    component_sample_affinity_consistency,
+    component_prototype_affinity_consistency,
     component_prototype_logits,
     componentwise_prototype_calibration,
 )
@@ -366,8 +366,9 @@ class PCASFSCILTrainer:
         for epoch in range(int(self.args.epochs_base)):
             sampler.set_epoch(epoch)
             self.model.train()
-            totals = {"total": 0.0, "component_proto": 0.0,
-                      "sample_aff": 0.0, "proto_aff": 0.0}
+            totals = {"total": 0.0, "mixture_proto": 0.0,
+                      "component_proto": 0.0, "sample_aff": 0.0,
+                      "proto_aff": 0.0}
             warmup_epochs = int(getattr(self.args, "affinity_warmup_epochs", 10))
             warmup_progress = (
                 1.0 if warmup_epochs <= 0
@@ -376,10 +377,10 @@ class PCASFSCILTrainer:
             num_batches = 0
 
             # Refresh deterministic student prototype cache once per epoch.
-            student_cache = self._cache_prototypes(trainset, self.args.base_class, teacher=False)
-            component_cache = self._cache_component_prototypes(trainset, self.args.base_class)
+            component_cache = self._cache_component_prototypes(
+                trainset, self.args.base_class
+            )
             teacher_prototypes = teacher_cache["prototypes"].detach()
-            student_prototypes = student_cache["prototypes"].detach()
 
             for images, labels, indices in tqdm(
                 trainloader, desc=f"PCAS base epoch {epoch + 1}"
@@ -396,18 +397,21 @@ class PCASFSCILTrainer:
                 student_features, aux = self.model.encode_student(
                     images, return_aux=True
                 )
-                loss_component_proto = leave_one_out_component_prototype_loss(
+                prototype_losses = leave_one_out_component_prototype_losses(
                     aux["component_features"], aux["component_weights"], labels,
                     indices, component_cache,
-                    logit_scale=float(getattr(self.args, "pcas_logit_scale", 16.0)))
-                loss_sample = sample_affinity_consistency(
-                    teacher_features, student_features, labels,
-                    teacher_prototypes, student_prototypes,
-                    affinity_scale=float(getattr(self.args, "affinity_scale", 16.0))
+                    logit_scale=float(getattr(self.args, "pcas_logit_scale", 16.0)),
                 )
-                loss_relation = prototype_affinity_consistency(
-                    teacher_features, student_features, labels,
-                    affinity_scale=float(getattr(self.args, "affinity_scale", 16.0))
+                loss_mixture_proto = prototype_losses["mixture"]
+                loss_component_proto = prototype_losses["component"]
+                loss_sample = component_sample_affinity_consistency(
+                    teacher_features, aux["component_features"], labels,
+                    teacher_prototypes, component_cache["prototypes"],
+                    affinity_scale=float(getattr(self.args, "affinity_scale", 16.0)),
+                )
+                loss_relation = component_prototype_affinity_consistency(
+                    teacher_features, aux["component_features"], labels,
+                    affinity_scale=float(getattr(self.args, "affinity_scale", 16.0)),
                 )
 
                 lambda_aff_target = float(
@@ -416,7 +420,7 @@ class PCASFSCILTrainer:
                 lambda_aff = lambda_aff_target * warmup_progress
                 beta = float(getattr(self.args, "beta_affinity", 0.5))
                 loss = (
-                    loss_component_proto
+                    0.5 * (loss_mixture_proto + loss_component_proto)
                     + lambda_aff * (loss_sample + beta * loss_relation)
                 )
 
@@ -425,6 +429,7 @@ class PCASFSCILTrainer:
                 optimizer.step()
 
                 totals["total"] += float(loss.detach())
+                totals["mixture_proto"] += float(loss_mixture_proto.detach())
                 totals["component_proto"] += float(loss_component_proto.detach())
                 totals["sample_aff"] += float(loss_sample.detach())
                 totals["proto_aff"] += float(loss_relation.detach())

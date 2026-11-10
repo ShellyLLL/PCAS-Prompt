@@ -132,7 +132,7 @@ def component_prototype_logits(
     return logits * float(logit_scale)
 
 
-def leave_one_out_component_prototype_loss(
+def leave_one_out_component_prototype_losses(
     student_component_features,
     component_weights,
     labels,
@@ -140,7 +140,13 @@ def leave_one_out_component_prototype_loss(
     component_cache,
     logit_scale=16.0,
 ):
-    """Component-weighted prototype CE with each query removed from its class mean."""
+    """Return mixture and per-component leave-one-out prototype losses.
+
+    The mixture loss matches the final query-weighted component classifier.
+    The per-component loss independently supervises every shared component
+    feature space, so component index m has a stable cross-class meaning for
+    subsequent component-wise prototype calibration.
+    """
     labels = labels.long()
     dataset_indices = dataset_indices.long()
     if student_component_features.ndim != 3:
@@ -153,12 +159,27 @@ def leave_one_out_component_prototype_loss(
     prototypes = component_cache["prototypes"]
 
     batch_size, num_components, feature_dim = student_component_features.shape
+    if labels.ndim != 1 or labels.numel() != batch_size:
+        raise ValueError("Labels must contain one class ID per sample.")
     if component_weights.shape != (batch_size, num_components):
         raise ValueError("Component weights do not align with student features.")
+    if not torch.isfinite(component_weights).all() or torch.any(component_weights < 0):
+        raise ValueError("Component weights must be finite and non-negative.")
+    if not torch.allclose(
+        component_weights.sum(dim=-1),
+        torch.ones(batch_size, device=component_weights.device,
+                   dtype=component_weights.dtype),
+        atol=1e-5,
+    ):
+        raise ValueError("Each component-weight row must sum to one.")
     if cache_features.ndim != 3 or cache_features.shape[1:] != (
         num_components, feature_dim
     ):
         raise ValueError("Component cache shape does not match student features.")
+    if class_sums.shape != prototypes.shape or class_sums.shape[0] != num_components:
+        raise ValueError("Component prototype cache has inconsistent shapes.")
+    if labels.numel() == 0 or torch.any(labels < 0) or torch.any(labels >= prototypes.shape[1]):
+        raise ValueError("Labels are empty or outside the component prototype range.")
     if dataset_indices.ndim != 1 or dataset_indices.numel() != batch_size:
         raise ValueError("Dataset indices must contain one index per sample.")
     if torch.any(dataset_indices < 0) or torch.any(dataset_indices >= cache_labels.numel()):
@@ -168,36 +189,77 @@ def leave_one_out_component_prototype_loss(
     if torch.any(class_counts[labels] <= 1):
         raise ValueError("Leave-one-out prototypes require at least two samples per class.")
 
-    # [M,B,D] -> [B,M,D]
+    # The current sample's cached deterministic view is removed from its
+    # class sum. The remaining samples define its target-class prototype.
     selected_sums = class_sums[:, labels, :].permute(1, 0, 2)
     cached_samples = cache_features[dataset_indices]
     denominator = (class_counts[labels] - 1).to(
         student_component_features.dtype
     ).view(batch_size, 1, 1)
-    loo_means = (selected_sums - cached_samples) / denominator
-    loo_prototypes = F.normalize(loo_means, p=2, dim=-1)
-
-    normalized_features = F.normalize(
-        student_component_features, p=2, dim=-1
+    loo_prototypes = F.normalize(
+        (selected_sums - cached_samples) / denominator, p=2, dim=-1
     )
+
+    normalized_features = F.normalize(student_component_features, p=2, dim=-1)
     normalized_prototypes = F.normalize(prototypes, p=2, dim=-1)
-    all_component_similarities = torch.einsum(
+    all_similarities = torch.einsum(
         "bmd,mcd->bmc", normalized_features, normalized_prototypes
     )
     loo_target_similarities = (
         normalized_features * loo_prototypes
     ).sum(dim=-1)
 
-    logits = (
-        all_component_similarities * component_weights.unsqueeze(-1)
+    # Query-conditioned composition objective: exactly the score form used
+    # by the incremental classifier.
+    mixture_logits = (
+        all_similarities * component_weights.unsqueeze(-1)
     ).sum(dim=1)
-    loo_target_logits = (
+    mixture_target_logits = (
         loo_target_similarities * component_weights
     ).sum(dim=1)
-    logits = logits.scatter(
-        1, labels.unsqueeze(1), loo_target_logits.unsqueeze(1)
+    mixture_logits = mixture_logits.scatter(
+        1, labels.unsqueeze(1), mixture_target_logits.unsqueeze(1)
     )
-    return F.cross_entropy(logits * float(logit_scale), labels)
+    mixture_loss = F.cross_entropy(mixture_logits * float(logit_scale), labels)
+
+    # Each component must also be independently class-discriminative.
+    # This prevents a component from receiving no useful supervision merely
+    # because another component dominates the image-conditioned weights.
+    component_logits = all_similarities.scatter(
+        2,
+        labels[:, None, None].expand(-1, num_components, 1),
+        loo_target_similarities.unsqueeze(-1),
+    )
+    component_loss = F.cross_entropy(
+        component_logits.reshape(batch_size * num_components, -1)
+        * float(logit_scale),
+        labels[:, None].expand(-1, num_components).reshape(-1),
+    )
+
+    return {
+        "mixture": mixture_loss,
+        "component": component_loss,
+        "total": 0.5 * (mixture_loss + component_loss),
+    }
+
+
+def leave_one_out_component_prototype_loss(
+    student_component_features,
+    component_weights,
+    labels,
+    dataset_indices,
+    component_cache,
+    logit_scale=16.0,
+):
+    """Compatibility wrapper returning the unified component prototype loss."""
+    return leave_one_out_component_prototype_losses(
+        student_component_features,
+        component_weights,
+        labels,
+        dataset_indices,
+        component_cache,
+        logit_scale=logit_scale,
+    )["total"]
 
 
 def sample_affinity_consistency(
@@ -281,6 +343,141 @@ def prototype_affinity_consistency(
         teacher_distribution,
         reduction="batchmean",
     )
+
+
+def component_sample_affinity_consistency(
+    teacher_features,
+    student_component_features,
+    labels,
+    teacher_prototypes,
+    student_component_prototypes,
+    affinity_scale=16.0,
+):
+    """Preserve teacher sample-to-class affinities in every spatial component.
+
+    The teacher uses the original frozen ViT prototypes [C,D]. Each student
+    component uses its own prompt-enhanced prototype bank [M,C,D]. The same
+    non-target class set is compared for every component.
+    """
+    labels = labels.long()
+    if teacher_features.ndim != 2 or student_component_features.ndim != 3:
+        raise ValueError("Expected teacher [B,D] and component [B,M,D] features.")
+    if teacher_prototypes.ndim != 2 or student_component_prototypes.ndim != 3:
+        raise ValueError("Expected teacher [C,D] and component [M,C,D] prototypes.")
+    batch_size, num_components, feature_dim = student_component_features.shape
+    if teacher_features.shape != (batch_size, feature_dim):
+        raise ValueError("Teacher and component feature dimensions must match.")
+    if student_component_prototypes.shape[0] != num_components:
+        raise ValueError("Student prototype component count does not match features.")
+    if student_component_prototypes.shape[1:] != (
+        teacher_prototypes.shape[0], feature_dim
+    ):
+        raise ValueError("Teacher and component prototype banks are incompatible.")
+    if labels.shape != (batch_size,) or labels.numel() == 0:
+        raise ValueError("Labels must contain one class ID per sample.")
+    if torch.any(labels < 0) or torch.any(labels >= teacher_prototypes.shape[0]):
+        raise ValueError("Labels are outside the teacher prototype range.")
+
+    teacher = F.normalize(teacher_features, p=2, dim=-1)
+    teacher_bank = F.normalize(teacher_prototypes, p=2, dim=-1)
+    student = F.normalize(student_component_features, p=2, dim=-1)
+    student_bank = F.normalize(student_component_prototypes, p=2, dim=-1)
+
+    teacher_logits = teacher @ teacher_bank.t()
+    student_logits = torch.einsum("bmd,mcd->bmc", student, student_bank)
+
+    teacher_mask = torch.ones_like(teacher_logits, dtype=torch.bool)
+    teacher_mask.scatter_(1, labels.unsqueeze(1), False)
+    student_mask = teacher_mask.unsqueeze(1).expand_as(student_logits)
+    teacher_logits = teacher_logits.masked_fill(~teacher_mask, -torch.inf)
+    student_logits = student_logits.masked_fill(~student_mask, -torch.inf)
+
+    teacher_distribution = F.softmax(
+        teacher_logits * float(affinity_scale), dim=-1
+    ).detach()
+    student_log_distribution = F.log_softmax(
+        student_logits * float(affinity_scale), dim=-1
+    )
+    target = teacher_distribution.unsqueeze(1).expand(
+        -1, num_components, -1
+    )
+    return F.kl_div(
+        student_log_distribution.reshape(batch_size * num_components, -1),
+        target.reshape(batch_size * num_components, -1),
+        reduction="batchmean",
+    )
+
+
+def component_prototype_affinity_consistency(
+    teacher_features,
+    student_component_features,
+    labels,
+    affinity_scale=16.0,
+):
+    """Preserve the batch class-prototype graph in every component space."""
+    labels = labels.long()
+    if teacher_features.ndim != 2 or student_component_features.ndim != 3:
+        raise ValueError("Expected teacher [B,D] and component [B,M,D] features.")
+    batch_size, num_components, feature_dim = student_component_features.shape
+    if teacher_features.shape != (batch_size, feature_dim):
+        raise ValueError("Teacher and component feature dimensions must match.")
+    if labels.shape != (batch_size,) or labels.numel() == 0:
+        raise ValueError("Labels must contain one class ID per sample.")
+
+    classes, inverse = torch.unique(labels, sorted=True, return_inverse=True)
+    if classes.numel() < 2:
+        return student_component_features.sum() * 0.0
+
+    num_classes = classes.numel()
+    teacher_means = torch.zeros(
+        num_classes, feature_dim,
+        device=teacher_features.device, dtype=teacher_features.dtype,
+    )
+    teacher_means.index_add_(0, inverse, teacher_features)
+    student_means = torch.zeros(
+        num_components, num_classes, feature_dim,
+        device=student_component_features.device,
+        dtype=student_component_features.dtype,
+    )
+    student_means.index_add_(
+        1, inverse, student_component_features.permute(1, 0, 2)
+    )
+    counts = torch.bincount(inverse, minlength=num_classes).to(
+        teacher_features.dtype
+    )
+
+    teacher_means = F.normalize(
+        teacher_means / counts.unsqueeze(1), p=2, dim=-1
+    )
+    student_means = F.normalize(
+        student_means / counts[None, :, None], p=2, dim=-1
+    )
+    teacher_relation = teacher_means @ teacher_means.t()
+    student_relation = torch.einsum(
+        "mkd,mjd->mkj", student_means, student_means
+    )
+
+    diagonal = torch.eye(
+        num_classes, device=labels.device, dtype=torch.bool
+    )
+    teacher_relation = teacher_relation.masked_fill(diagonal, -torch.inf)
+    student_relation = student_relation.masked_fill(
+        diagonal.unsqueeze(0), -torch.inf
+    )
+    teacher_distribution = F.softmax(
+        teacher_relation * float(affinity_scale), dim=-1
+    ).detach()
+    student_log_distribution = F.log_softmax(
+        student_relation * float(affinity_scale), dim=-1
+    )
+    teacher_log_distribution = teacher_distribution.clamp_min(
+        torch.finfo(teacher_distribution.dtype).tiny
+    ).log()
+    kl_per_component_row = (
+        teacher_distribution.unsqueeze(0)
+        * (teacher_log_distribution.unsqueeze(0) - student_log_distribution)
+    ).sum(dim=-1)
+    return kl_per_component_row.mean()
 
 
 @torch.no_grad()
