@@ -1,28 +1,36 @@
-# PCAS-Prompt
-
-Prototype-Calibrated Affinity-Consistent Spatial Prompt Learning for Few-Shot Class-Incremental Learning.
-
-This repository implements PCAS-Prompt on top of the existing LGSP-Prompt FSCIL data protocol. The ViT-B/16 backbone is frozen; a four-component decomposed spatial prompt is injected after transformer block 6 without adding tokens. The fixed spatial component bank is fused by image-conditioned attention; all calibration and classification use visual features from the same frozen ViT.
+This repository implements PCAS-Prompt on top of the existing FSCIL data protocol. The ViT-B/16 backbone is frozen; a fixed-capacity decomposed spatial prompt is injected after transformer block 6 without adding tokens. All spatial components are composed before injection and the model emits exactly one final student feature per image.
 
 ## Method contract
 
-The implementation follows the revised PCAS definition:
+The implementation follows one unified PCAS architecture:
 
-- Frozen ImageNet-21K ViT-B/16, 224x224 input, 14x14 patch grid.
-- Spatial prompts are generated from block-6 patch features through a shared 96-channel bottleneck and four depthwise 3x3 component branches.
-- The CLS feature generates a query in the shared bottleneck space. Component-specific sigmoid gates modulate the normalized query, which is cosine-matched with normalized component keys; a temperature-scaled softmax produces image-conditioned component weights. These weights fuse the fixed spatial components.
-- The residual scale is parameterized as `gamma_max * sigmoid(rho)`, initialized to 0.1 and bounded above by 0.5.
-- Only patch tokens receive the residual spatial prompt. CLS is unchanged at the injection point and the token count remains 197.
-- Base training uses one deterministic epoch-level cache of isolated component features and class sums. Every minibatch receives two prototype objectives: a query-weighted mixture objective matching the final classifier, and an independent leave-one-out classification objective for every component. The leave-one-out target removes the same underlying sample from its class sum before scoring.
-- Teacher features/prototypes come from the original frozen ViT. Student affinity targets are evaluated separately in each component feature space against that component's class-prototype bank. A second consistency term preserves the teacher batch class-prototype affinity graph in every component space. Both affinity terms use the same non-target class set and are warmed up together.
-- After base training, PCAS and the backbone are frozen. Base-class prototypes are stored separately for every component in the final PCAS feature space. Component identity is preserved from prompt generation through prototype construction, calibration and inference.
-- Each novel class has one prototype per component, computed only from its real K-shot support set. Each novel component is calibrated only against the corresponding component prototypes of base classes. The final class score is the query-weighted sum of component-to-component prototype similarities; no feature from one component is calibrated with another component's prototype. Prompt parameters remain frozen after base training.
+- Frozen ImageNet-21K ViT-B/16, 224x224 input, 14x14 Patch grid.
+- Patch features from block 6 pass through one shared bottleneck and a fixed bank of spatial transformation components.
+- The CLS feature generates a Query. Component-specific gates and Keys produce continuous Query-Key-Attention weights over the fixed spatial components.
+- The weighted sum of spatial prompt maps is injected once into the Patch tokens. CLS is unchanged at injection; token count remains 197.
+- The frozen ViT tail runs exactly once. Each image produces one normalized student feature \(z_i\) and its component weights \(\omega_i\). No isolated component features or independent component encoders are created.
+- Class/component prototypes are conditioned by the image-level component weights:
+  \[
+  p_{c,m}=\operatorname{Norm}\left(
+  \frac{\sum_{i:y_i=c}\omega_{i,m}z_i}
+  {\sum_{i:y_i=c}\omega_{i,m}}
+  \right).
+  \]
+- Query classification recomposes one class prototype per query:
+  \[
+  s_c(x)=\kappa\,z(x)^\top
+  \operatorname{Norm}\left(\sum_m\omega_m(x)p_{c,m}\right).
+  \]
+  Base training and real FSCIL inference use this same score definition.
+- Base training uses weighted leave-one-out prototype classification, component-specific prototype supervision over the same unified feature, and the two PCAC affinity objectives. The original frozen ViT supplies teacher targets only for PCAC.
+- At each real incremental session, each novel class's component-conditioned prototypes are computed from its actual K-shot support features and weights. Each component is calibrated only against the matching component prototypes of base classes. The calibrated prototypes are appended without changing old prototypes.
+- The ViT and learned spatial prompt are frozen throughout incremental sessions. There is no replay, pseudo-class construction, pseudo-incremental training, or incremental Prompt fine-tuning.
 
 ## Repository layout
 
 - `models/base/pcas_modules.py`: frozen ViT-B/16 and PCAS spatial prompt bank.
-- `models/base/pcas_losses.py`: component prototype caches, component-weighted leave-one-out classification, component-wise calibration, and global-feature affinity-consistency losses.
-- `models/base/pcas_trainer.py`: base training, cache refresh, real incremental sessions, metrics and checkpoints.
+- `models/base/pcas_losses.py`: component-conditioned prototype construction, weighted leave-one-out classification, same-component calibration, and PCAC affinity losses.
+- `models/base/pcas_trainer.py`: single-stream base training, real K-shot prototype construction, incremental calibration, metrics and checkpoints.
 - `models/base/ViT_Network.py`: compatibility import for the PCAS model.
 - `models/base/ViT_fscil_trainer.py`: compatibility import for the PCAS trainer.
 
@@ -144,11 +152,11 @@ These are reproducible starting settings, not claimed dataset-wise optima.
 
 Runs are saved under `<repository_root>/checkpoint/PCAS/<dataset>/<timestamp>/`, independent of the shell's current working directory.
 
-- `pcas_base.pth`: final frozen PCAS model, final component-wise base prototypes, and global teacher/student prototypes for diagnostics.
-- `pcas_final.pth`: model, all component-wise class prototypes, session accuracies and summary.
+- `pcas_base.pth`: final frozen PCAS model, component-conditioned base prototypes, and global teacher/student prototypes for diagnostics.
+- `pcas_final.pth`: model, all component-conditioned class prototypes, session accuracies and summary.
 - `results.txt`: per-epoch and per-session records.
 
-The summary reports mean session class-average accuracy (AA) and PD = base-session class-average accuracy minus final-session class-average accuracy. Each session also reports base/novel accuracy, their harmonic mean (HMean), novel-to-base error rate (TBR), attention-weighted component-prototype distance and component usage/attention-entropy diagnostics. TBR is the fraction of novel test examples predicted as base classes; it is not limited to semantically nearest base classes. Component usage and attention entropy are descriptive diagnostics, not proof by themselves that components are functionally distinct.
+The summary reports mean session class-average accuracy (AA) and PD = base-session class-average accuracy minus final-session class-average accuracy. Each session also reports base/novel accuracy, their harmonic mean (HMean), novel-to-base error rate (TBR), distance to the query-conditioned recomposed target prototype, and component usage/attention-entropy diagnostics. TBR is the fraction of novel test examples predicted as base classes; it is not limited to semantically nearest base classes. Component usage and attention entropy are descriptive diagnostics, not proof by themselves that components are functionally distinct.
 
 ## Important limitations
 

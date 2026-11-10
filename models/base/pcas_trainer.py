@@ -15,14 +15,18 @@ from dataloader.data_utils import set_up_datasets, get_base_dataloader, get_new_
 from .pcas_modules import PCASViT
 from .pcas_losses import (
     build_prototype_cache,
-    build_component_prototype_cache,
-    leave_one_out_component_prototype_losses,
+    build_component_conditioned_prototype_cache,
+    build_component_conditioned_prototypes,
+    leave_one_out_component_conditioned_losses,
     component_sample_affinity_consistency,
     component_prototype_affinity_consistency,
-    component_prototype_logits,
+    component_conditioned_prototype_logits,
     componentwise_prototype_calibration,
 )
-from .pcas_metrics import component_weight_statistics, mean_component_prototype_distance
+from .pcas_metrics import (
+    component_weight_statistics,
+    mean_component_conditioned_prototype_distance,
+)
 
 
 class ClassBalancedBatchSampler(Sampler):
@@ -231,8 +235,8 @@ class PCASFSCILTrainer:
         os.makedirs(self.save_dir, exist_ok=True)
 
         self.base_prototypes = None
-        self.base_component_prototypes = None
-        self.all_component_prototypes = None
+        self.base_component_conditioned_prototypes = None
+        self.all_component_conditioned_prototypes = None
         self.base_teacher_prototypes = None
         self.base_accuracy = None
         # Macro class accuracy is retained for AA/PD. These histories add the
@@ -281,40 +285,51 @@ class PCASFSCILTrainer:
         ])
 
     @torch.no_grad()
-    def _extract_features(self, dataset, teacher=False, batch_size=None, return_components=False):
+    def _extract_features(
+        self, dataset, teacher=False, batch_size=None, return_component_weights=False
+    ):
+        if teacher and return_component_weights:
+            raise ValueError("Teacher extraction does not produce PCAS component weights.")
         original_transform = dataset.transform
         was_training = self.model.training
         dataset.transform = self._make_eval_transform(dataset)
-        loader = self._loader(IndexedDataset(dataset),
-            batch_size or int(getattr(self.args, "test_batch_size", 128)), shuffle=False)
-        features, labels, indices, components, weights = [], [], [], [], []
+        loader = self._loader(
+            IndexedDataset(dataset),
+            batch_size or int(getattr(self.args, "test_batch_size", 128)),
+            shuffle=False,
+        )
+        features, labels, indices, component_weights = [], [], [], []
         self.model.eval()
         try:
             for images, target, index in tqdm(loader, desc="Extract features"):
                 images = images.to(self.device, non_blocking=True)
                 if teacher:
-                    output, auxiliary = self.model.encode_teacher(images), None
-                elif return_components:
-                    output, auxiliary = self.model.encode_student(images, return_aux=True)
+                    output = self.model.encode_teacher(images)
+                    auxiliary = None
+                elif return_component_weights:
+                    output, auxiliary = self.model.encode_student(
+                        images, return_aux=True
+                    )
                 else:
-                    output, auxiliary = self.model.encode_student(images), None
+                    output = self.model.encode_student(images)
+                    auxiliary = None
                 features.append(output.cpu())
                 if auxiliary is not None:
-                    components.append(auxiliary["component_features"].cpu())
-                    weights.append(auxiliary["component_weights"].cpu())
+                    component_weights.append(auxiliary["component_weights"].cpu())
                 labels.append(torch.as_tensor(target).long().cpu())
                 indices.append(torch.as_tensor(index).long().cpu())
         finally:
             dataset.transform = original_transform
             self.model.train(was_training)
-        result = (torch.cat(features).to(self.device),
-                  torch.cat(labels).to(self.device),
-                  torch.cat(indices).to(self.device))
-        if return_components:
-            if not components:
-                raise RuntimeError("Component features were not produced.")
-            return result + (torch.cat(components).to(self.device),
-                             torch.cat(weights).to(self.device))
+        result = (
+            torch.cat(features).to(self.device),
+            torch.cat(labels).to(self.device),
+            torch.cat(indices).to(self.device),
+        )
+        if return_component_weights:
+            if not component_weights:
+                raise RuntimeError("PCAS component weights were not produced.")
+            return result + (torch.cat(component_weights).to(self.device),)
         return result
 
     @torch.no_grad()
@@ -323,10 +338,13 @@ class PCASFSCILTrainer:
         return build_prototype_cache(features, labels, num_classes)
 
     @torch.no_grad()
-    def _cache_component_prototypes(self, dataset, num_classes):
-        _, labels, _, features, _ = self._extract_features(
-            dataset, teacher=False, return_components=True)
-        return build_component_prototype_cache(features, labels, num_classes)
+    def _cache_component_conditioned_prototypes(self, dataset, num_classes):
+        features, labels, _, component_weights = self._extract_features(
+            dataset, teacher=False, return_component_weights=True
+        )
+        return build_component_conditioned_prototype_cache(
+            features, component_weights, labels, num_classes
+        )
 
     def _base_optimizer(self):
         prompt_params = [p for p in self.model.pcas.parameters() if p.requires_grad]
@@ -377,7 +395,7 @@ class PCASFSCILTrainer:
             num_batches = 0
 
             # Refresh deterministic student prototype cache once per epoch.
-            component_cache = self._cache_component_prototypes(
+            component_cache = self._cache_component_conditioned_prototypes(
                 trainset, self.args.base_class
             )
             teacher_prototypes = teacher_cache["prototypes"].detach()
@@ -397,20 +415,21 @@ class PCASFSCILTrainer:
                 student_features, aux = self.model.encode_student(
                     images, return_aux=True
                 )
-                prototype_losses = leave_one_out_component_prototype_losses(
-                    aux["component_features"], aux["component_weights"], labels,
+                prototype_losses = leave_one_out_component_conditioned_losses(
+                    student_features, aux["component_weights"], labels,
                     indices, component_cache,
                     logit_scale=float(getattr(self.args, "pcas_logit_scale", 16.0)),
                 )
                 loss_mixture_proto = prototype_losses["mixture"]
                 loss_component_proto = prototype_losses["component"]
                 loss_sample = component_sample_affinity_consistency(
-                    teacher_features, aux["component_features"], labels,
-                    teacher_prototypes, component_cache["prototypes"],
+                    teacher_features, student_features, aux["component_weights"],
+                    labels, teacher_prototypes, component_cache["prototypes"],
                     affinity_scale=float(getattr(self.args, "affinity_scale", 16.0)),
                 )
                 loss_relation = component_prototype_affinity_consistency(
-                    teacher_features, aux["component_features"], labels,
+                    teacher_features, student_features, aux["component_weights"],
+                    labels,
                     affinity_scale=float(getattr(self.args, "affinity_scale", 16.0)),
                 )
 
@@ -424,8 +443,22 @@ class PCASFSCILTrainer:
                     + lambda_aff * (loss_sample + beta * loss_relation)
                 )
 
+                if not torch.isfinite(loss).all():
+                    raise FloatingPointError("Non-finite PCAS training loss.")
+                if not torch.isfinite(loss_component_proto).all():
+                    raise FloatingPointError("Non-finite component prototype loss.")
+                if not torch.allclose(
+                    aux["component_weights"].sum(-1),
+                    torch.ones_like(aux["component_weights"].sum(-1)),
+                    atol=1e-5,
+                ):
+                    raise RuntimeError("Spatial component weights do not sum to one.")
+
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                for parameter in self.model.pcas.parameters():
+                    if parameter.grad is not None and not torch.isfinite(parameter.grad).all():
+                        raise FloatingPointError("Non-finite PCAS prompt gradient.")
                 optimizer.step()
 
                 totals["total"] += float(loss.detach())
@@ -434,14 +467,6 @@ class PCASFSCILTrainer:
                 totals["sample_aff"] += float(loss_sample.detach())
                 totals["proto_aff"] += float(loss_relation.detach())
                 num_batches += 1
-
-                if not torch.isfinite(loss):
-                    raise FloatingPointError("Non-finite PCAS training loss.")
-
-                if not torch.isfinite(loss_component_proto):
-                    raise FloatingPointError("Non-finite component prototype loss.")
-                if not torch.allclose(aux["component_weights"].sum(-1), torch.ones(images.shape[0], device=self.device), atol=1e-5):
-                    raise RuntimeError("Spatial component weights do not sum to one.")
 
             scheduler.step()
             summary = {
@@ -463,9 +488,11 @@ class PCASFSCILTrainer:
         final_student = self._cache_prototypes(
             trainset, self.args.base_class, teacher=False
         )
-        final_components = self._cache_component_prototypes(trainset, self.args.base_class)
+        final_components = self._cache_component_conditioned_prototypes(
+            trainset, self.args.base_class
+        )
         self.base_prototypes = final_student["prototypes"].detach()
-        self.base_component_prototypes = final_components["prototypes"].detach()
+        self.base_component_conditioned_prototypes = final_components["prototypes"].detach()
         self.base_teacher_prototypes = teacher_cache["prototypes"].detach()
 
         # Store global fused prototypes for checkpoint diagnostics only.
@@ -473,7 +500,7 @@ class PCASFSCILTrainer:
             {
                 "model": self.model.state_dict(),
                 "base_student_prototypes": self.base_prototypes.cpu(),
-                "base_component_prototypes": self.base_component_prototypes.cpu(),
+                "base_component_conditioned_prototypes": self.base_component_conditioned_prototypes.cpu(),
                 "base_teacher_prototypes_for_audit": self.base_teacher_prototypes.cpu(),
                 "base_classes": int(self.args.base_class),
                 "method": "PCAS-Prompt",
@@ -483,13 +510,19 @@ class PCASFSCILTrainer:
         )
 
     @torch.no_grad()
-    def _evaluate(self, testset, seen_classes, all_component_prototypes, session):
-        features, labels, _, component_features, component_weights = self._extract_features(testset, teacher=False, return_components=True)
+    def _evaluate(
+        self, testset, seen_classes, all_component_conditioned_prototypes, session
+    ):
+        features, labels, _, component_weights = self._extract_features(
+            testset, teacher=False, return_component_weights=True
+        )
         validate_seen_class_coverage(labels, seen_classes, session)
-        logits = component_prototype_logits(component_features, component_weights,
-            all_component_prototypes[:, :seen_classes, :],
-            logit_scale=float(getattr(self.args, "pcas_logit_scale", 16.0)))
-        logits = logits[:, :seen_classes]
+        logits = component_conditioned_prototype_logits(
+            features,
+            component_weights,
+            all_component_conditioned_prototypes[:, :seen_classes, :],
+            logit_scale=float(getattr(self.args, "pcas_logit_scale", 16.0)),
+        )
         predictions = logits.argmax(dim=1)
         accuracy = (predictions == labels).float().mean().item()
         task_wise_accuracy = compute_taskwise_accuracy(
@@ -498,7 +531,6 @@ class PCASFSCILTrainer:
             way=self.args.way,
             session=session,
         )
-
         per_class_accuracy = []
         for class_id in range(seen_classes):
             class_mask = labels == class_id
@@ -510,7 +542,6 @@ class PCASFSCILTrainer:
             torch.stack(per_class_accuracy).mean().item()
             if per_class_accuracy else float("nan")
         )
-
         base_mask = labels < self.args.base_class
         novel_mask = ~base_mask
         base_acc = (
@@ -526,9 +557,8 @@ class PCASFSCILTrainer:
             if base_mask.any() and novel_mask.any() and (base_acc + novel_acc) > 0
             else float("nan")
         )
-        # TBR is the fraction of novel test samples predicted as a base class.
         tbr = (
-            float(((predictions[novel_mask] < self.args.base_class).float().mean()).item())
+            float((predictions[novel_mask] < self.args.base_class).float().mean().item())
             if novel_mask.any() else float("nan")
         )
         metrics = {
@@ -539,9 +569,12 @@ class PCASFSCILTrainer:
             "base_novel_hmean": hmean,
             "novel_to_base_error_rate": tbr,
             "task_wise_accuracy": task_wise_accuracy,
-            "mean_component_prototype_distance": mean_component_prototype_distance(
-                component_features, component_weights, labels,
-                all_component_prototypes[:, :seen_classes, :]),
+            "mean_component_conditioned_prototype_distance": (
+                mean_component_conditioned_prototype_distance(
+                    features, component_weights, labels,
+                    all_component_conditioned_prototypes[:, :seen_classes, :],
+                )
+            ),
         }
         metrics.update(component_weight_statistics(component_weights))
         return metrics
@@ -598,31 +631,43 @@ class PCASFSCILTrainer:
                 "support_test_overlap": len(overlap),
             })
 
-        _, support_labels, _, support_components, _ = self._extract_features(trainset, teacher=False, return_components=True)
-        novel_component_prototypes = []
+        support_features, support_labels, _, support_weights = self._extract_features(
+            trainset, teacher=False, return_component_weights=True
+        )
+        novel_component_conditioned_prototypes = []
         for class_id in novel_classes:
-            class_features = support_components[support_labels == int(class_id)]
-            if class_features.numel() == 0:
-                raise RuntimeError(f"No component features for novel class {class_id}.")
-            novel_component_prototypes.append(F.normalize(class_features.mean(0), dim=-1))
-        novel_component_prototypes = torch.stack(novel_component_prototypes, dim=0)
-        calibrated_components, calibration_weights, matched_base_classes = componentwise_prototype_calibration(
-            novel_component_prototypes, self.base_component_prototypes,
-            alpha=float(getattr(self.args, "component_calibration_alpha", 0.5)),
-            tau=float(getattr(self.args, "component_calibration_tau", 16.0)),
-            top_r=int(getattr(self.args, "component_calibration_top_r", 5)))
+            class_mask = support_labels == int(class_id)
+            if not torch.any(class_mask):
+                raise RuntimeError(f"No support features for novel class {class_id}.")
+            novel_component_conditioned_prototypes.append(
+                build_component_conditioned_prototypes(
+                    support_features[class_mask], support_weights[class_mask]
+                )
+            )
+        novel_component_conditioned_prototypes = torch.stack(
+            novel_component_conditioned_prototypes, dim=0
+        )
+        calibrated_component_conditioned_prototypes, calibration_weights, matched_base_classes = (
+            componentwise_prototype_calibration(
+                novel_component_conditioned_prototypes,
+                self.base_component_conditioned_prototypes,
+                alpha=float(getattr(self.args, "component_calibration_alpha", 0.5)),
+                tau=float(getattr(self.args, "component_calibration_tau", 16.0)),
+                top_r=int(getattr(self.args, "component_calibration_top_r", 5)),
+            )
+        )
 
         # Append new prototypes by their global class ids. Old prototypes never
         # change; PCAS and ViT are frozen for every incremental session.
-        if self.all_component_prototypes is None:
-            self.all_component_prototypes = torch.zeros(self.base_component_prototypes.shape[0], int(self.args.num_classes), self.base_component_prototypes.shape[-1], device=self.device, dtype=self.base_component_prototypes.dtype)
-            self.all_component_prototypes[:, :self.args.base_class, :] = self.base_component_prototypes
+        if self.all_component_conditioned_prototypes is None:
+            self.all_component_conditioned_prototypes = torch.zeros(self.base_component_conditioned_prototypes.shape[0], int(self.args.num_classes), self.base_component_conditioned_prototypes.shape[-1], device=self.device, dtype=self.base_component_conditioned_prototypes.dtype)
+            self.all_component_conditioned_prototypes[:, :self.args.base_class, :] = self.base_component_conditioned_prototypes
         for offset, class_id in enumerate(novel_classes):
-            self.all_component_prototypes[:, int(class_id), :] = calibrated_components[offset]
+            self.all_component_conditioned_prototypes[:, int(class_id), :] = calibrated_component_conditioned_prototypes[offset]
 
         seen_classes = self.args.base_class + session * self.args.way
         metrics = self._evaluate(
-            testset, seen_classes, self.all_component_prototypes, session=session
+            testset, seen_classes, self.all_component_conditioned_prototypes, session=session
         )
         metrics.update({"session": session, "novel_classes": novel_classes.tolist(),
                         "component_calibration_weights": calibration_weights.cpu().tolist(),
@@ -670,12 +715,12 @@ class PCASFSCILTrainer:
                 "train_test_overlap": len(overlap),
             })
         self._train_base(trainset, trainloader)
-        self.all_component_prototypes = torch.zeros(self.base_component_prototypes.shape[0], int(self.args.num_classes), self.base_component_prototypes.shape[-1], device=self.device, dtype=self.base_component_prototypes.dtype)
-        self.all_component_prototypes[:, :self.args.base_class, :] = self.base_component_prototypes
+        self.all_component_conditioned_prototypes = torch.zeros(self.base_component_conditioned_prototypes.shape[0], int(self.args.num_classes), self.base_component_conditioned_prototypes.shape[-1], device=self.device, dtype=self.base_component_conditioned_prototypes.dtype)
+        self.all_component_conditioned_prototypes[:, :self.args.base_class, :] = self.base_component_conditioned_prototypes
 
         # Evaluate the base session using the final frozen student prototypes.
         base_metrics = self._evaluate(
-            testloader.dataset, self.args.base_class, self.all_component_prototypes,
+            testloader.dataset, self.args.base_class, self.all_component_conditioned_prototypes,
             session=0,
         )
         base_metrics.update({"session": 0})
@@ -741,8 +786,8 @@ class PCASFSCILTrainer:
             {
                 "model": self.model.state_dict(),
                 "base_student_prototypes": self.base_prototypes.cpu(),
-                "base_component_prototypes": self.base_component_prototypes.cpu(),
-                "all_component_prototypes": self.all_component_prototypes.cpu(),
+                "base_component_conditioned_prototypes": self.base_component_conditioned_prototypes.cpu(),
+                "all_component_conditioned_prototypes": self.all_component_conditioned_prototypes.cpu(),
                 "session_accuracies": self.session_accuracies,
                 "AA": summary["AA"],
                 "final_session_class_accuracy": summary["final_session_class_accuracy"],

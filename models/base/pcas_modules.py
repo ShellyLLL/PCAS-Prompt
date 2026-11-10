@@ -1,9 +1,4 @@
-"""PCAS-Prompt: decomposed spatial prompting with component-wise prototypes.
-
-The ViT-B/16 backbone is frozen. A fixed bank of local spatial prompt
-components is inserted after block 6. Component features are extracted by
-running each isolated component through the same frozen ViT tail.
-"""
+"""Single-stream PCAS spatial prompting and unified visual feature extraction."""
 import math
 
 import torch
@@ -36,11 +31,12 @@ class SpatialPromptComponent(nn.Module):
 
 
 class PCASPrompt(nn.Module):
-    """Fixed-capacity decomposed spatial prompt with Query-Key attention.
+    """Fixed-capacity spatial prompt components composed by CLS attention.
 
-    Every component is generated from the same low-dimensional Patch feature
-    map. A CLS-derived query assigns image-conditioned component weights.
-    These weights fuse the component prompts without changing token count.
+    Components operate on one shared Patch map. CLS Query-Key attention
+    continuously weights their spatial prompt maps; the weighted sum is
+    injected once into the Patch stream. This module never creates component
+    feature streams.
     """
 
     def __init__(
@@ -166,16 +162,11 @@ class PCASPrompt(nn.Module):
         enhanced_map = patch_map + gamma * mixed_prompt
         enhanced_patch_tokens = enhanced_map.flatten(2).transpose(1, 2)
 
-        isolated_patch_tokens = (
-            patch_tokens.unsqueeze(1)
-            + gamma * component_maps.flatten(3).transpose(2, 3)
-        )
-        # [B, M, N, C], one isolated spatial component per branch.
-        return enhanced_patch_tokens, isolated_patch_tokens, component_weights
+        return enhanced_patch_tokens, component_weights
 
 
 class PCASViT(nn.Module):
-    """Frozen ViT-B/16 with decomposed spatial prompting and component features."""
+    """Frozen ViT-B/16 with one PCAS-enhanced visual feature stream."""
 
     def __init__(self, args, mode=None):
         super().__init__()
@@ -245,39 +236,22 @@ class PCASViT(nn.Module):
         return F.normalize(features, p=2, dim=-1)
 
     def encode_student(self, images: torch.Tensor, return_aux: bool = False):
-        """Return the fused feature and, when requested, isolated component features."""
+        """Encode one image batch once and optionally expose its component weights."""
         if images.shape[-2:] != (224, 224):
             raise ValueError("PCAS ViT-B/16 expects 224x224 input images.")
-
         tokens = self.encoder.patch_embed(images)
         tokens = self.encoder._pos_embed(tokens)
         for block in self.encoder.blocks[:self.insert_after]:
             tokens = block(tokens)
-
-        enhanced_patches, isolated_patches, component_weights = self.pcas(
-            tokens[:, 1:, :],
-            tokens[:, 0, :],
-            self.grid_size,
+        enhanced_patches, component_weights = self.pcas(
+            tokens[:, 1:, :], tokens[:, 0, :], self.grid_size
         )
-
-        fused_tokens = torch.cat(
-            [tokens[:, :1, :], enhanced_patches], dim=1
-        )
-        fused_features = self._run_frozen_tail(fused_tokens)
-
+        enhanced_tokens = torch.cat([tokens[:, :1, :], enhanced_patches], dim=1)
+        # Exactly one frozen-tail pass and one final student feature per image.
+        features = self._run_frozen_tail(enhanced_tokens)
         if not return_aux:
-            return fused_features
-
-        component_features = []
-        for component_index in range(self.pcas.num_components):
-            component_tokens = torch.cat(
-                [tokens[:, :1, :], isolated_patches[:, component_index]], dim=1
-            )
-            component_features.append(self._run_frozen_tail(component_tokens))
-        component_features = torch.stack(component_features, dim=1)
-
-        return fused_features, {
-            "component_features": component_features,
+            return features
+        return features, {
             "component_weights": component_weights,
             "residual_scale": self.pcas.residual_scale,
         }
@@ -289,7 +263,6 @@ class PCASViT(nn.Module):
         features, auxiliary = self.encode_student(images, return_aux=True)
         return {
             "features": features,
-            "component_features": auxiliary["component_features"],
             "component_weights": auxiliary["component_weights"],
             "residual_scale": auxiliary["residual_scale"],
         }
