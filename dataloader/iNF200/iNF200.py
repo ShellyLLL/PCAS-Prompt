@@ -67,7 +67,11 @@ class iNF200(Dataset):
         selected_data = []
         
        
-        all_classes = sorted(os.listdir(osp.join(self.root, 'iNF200', "train_mini")))
+        train_dir = osp.join(self.root, "iNF200", "train_mini")
+        all_classes = sorted(
+            name for name in os.listdir(train_dir)
+            if osp.isdir(osp.join(train_dir, name))
+        )
         
         for class_idx in class_indices:
             if class_idx >= len(all_classes):
