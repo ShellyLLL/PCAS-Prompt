@@ -16,7 +16,19 @@ def get_command_line_parser():
     parser.add_argument('-project', type=str, default=PROJECT)
     parser.add_argument('-dataroot', type=str, default=DATA_DIR)
     parser.add_argument('-out', type=str, default='PCAS')
-    parser.add_argument('--method', type=str, default='pcas', choices=['pcas', 'lsp_proto'],\n                        help='Select PCAS or LGSP-LSP prototype-based FSCIL.')\n    parser.add_argument('--lsp_pool_size', type=int, default=30)\n    parser.add_argument('--lsp_top_k', type=int, default=10)\n    parser.add_argument('--lsp_hidden_dim', type=int, default=3)\n    parser.add_argument('--lsp_kernel_size1', type=int, default=3)\n    parser.add_argument('--lsp_kernel_size2', type=int, default=5)\n    parser.add_argument('--lsp_dropout', type=float, default=0.1)\n    parser.add_argument('--lsp_temperature', type=float, default=0.2)\n    parser.add_argument('--lsp_lr', type=float, default=2e-4)\n    parser.add_argument('--lsp_weight_decay', type=float, default=1e-4)\n    parser.add_argument('--lsp_logit_scale', type=float, default=16.0)\n    parser.add_argument('--index_list_root', type=str,
+    parser.add_argument('--method', type=str, default='pcas', choices=['pcas', 'lsp_proto'],
+                        help='Select PCAS or LGSP-LSP prototype-based FSCIL.')
+    parser.add_argument('--lsp_pool_size', type=int, default=30)
+    parser.add_argument('--lsp_top_k', type=int, default=10)
+    parser.add_argument('--lsp_hidden_dim', type=int, default=3)
+    parser.add_argument('--lsp_kernel_size1', type=int, default=3)
+    parser.add_argument('--lsp_kernel_size2', type=int, default=5)
+    parser.add_argument('--lsp_dropout', type=float, default=0.1)
+    parser.add_argument('--lsp_temperature', type=float, default=0.2)
+    parser.add_argument('--lsp_lr', type=float, default=2e-4)
+    parser.add_argument('--lsp_weight_decay', type=float, default=1e-4)
+    parser.add_argument('--lsp_logit_scale', type=float, default=16.0)
+    parser.add_argument('--index_list_root', type=str,
                         default=os.environ.get("FSCIL_INDEX_LIST_ROOT"),
                         help='Session split root. Defaults to <dataroot>/index_list.')
     parser.add_argument('--pcas_layer', type=int, default=6)
@@ -212,7 +224,10 @@ if __name__ == '__main__':
     pprint(vars(args))
     args.num_gpu = set_gpu(args)
 
-    if args.method == 'lsp_proto':\n        trainer = importlib.import_module('models.%s.lsp_fscil_trainer' % (args.project)).LSPPrototypeFSCILTrainer(args)\n    elif args.vit:\n        if args.baseline:
+    if args.method == 'lsp_proto':
+        trainer = importlib.import_module('models.%s.lsp_fscil_trainer' % (args.project)).LSPPrototypeFSCILTrainer(args)
+    elif args.vit:
+        if args.baseline:
             trainer = importlib.import_module('models.%s.ViT_fscil_Baseline_trainer' % (args.project)).ViT_Baseline_FSCILTrainer(args)
         #* L2P / DP
         elif args.l2p:
