@@ -13,7 +13,7 @@ The implementation follows the revised PCAS definition:
 - The CLS feature generates a query in the shared bottleneck space. Component-specific sigmoid gates modulate the normalized query, which is cosine-matched with normalized component keys; a temperature-scaled softmax produces image-conditioned component weights. These are fusion weights over a fixed component bank, not a class/task router.
 - The residual scale is parameterized as `gamma_max * sigmoid(rho)`, initialized to 0.1 and bounded above by 0.5.
 - Only patch tokens receive the residual spatial prompt. CLS is unchanged at the injection point and the token count remains 197.
-- Base training optimizes the spatial prompt and base classifier with fused-feature CE, leave-one-out component-prototype CE, sample-prototype affinity KL, and batch class-prototype affinity KL. The combined affinity coefficient is linearly warmed up over the first 10 epochs by default.
+- Base training optimizes the spatial prompt with leave-one-out component-prototype classification, sample-prototype affinity KL, and batch class-prototype affinity KL. The combined affinity coefficient is linearly warmed up over the first 10 epochs by default.
 - Teacher features/prototypes come from the original frozen ViT. Student features/prototypes come from the final PCAS-enhanced ViT.
 - After base training, PCAS and the backbone are frozen. Base-class prototypes are stored separately for every isolated spatial component in the final PCAS feature space. Teacher global features are used only for affinity-consistency training.
 - Each novel class has one prototype per spatial component, computed from its real K-shot support set. Each component is calibrated only against the corresponding component prototypes of base classes; the calibrated component prototypes are retained separately for final query-weighted component-similarity classification. No prompt fine-tuning, replay, or pseudo-incremental episodes are used.
@@ -21,7 +21,7 @@ The implementation follows the revised PCAS definition:
 ## Repository layout
 
 - `models/base/pcas_modules.py`: frozen ViT-B/16 and PCAS spatial prompt bank.
-- `models/base/pcas_losses.py`: global and component prototype caches, component-weighted leave-one-out prototype loss, component-wise calibration, and affinity-consistency losses.
+- `models/base/pcas_losses.py`: component prototype caches, component-weighted leave-one-out classification, component-wise calibration, and global-feature affinity-consistency losses.
 - `models/base/pcas_trainer.py`: base training, cache refresh, real incremental sessions, metrics and checkpoints.
 - `models/base/ViT_Network.py`: compatibility import for the PCAS model.
 - `models/base/ViT_fscil_trainer.py`: compatibility import for the PCAS trainer.

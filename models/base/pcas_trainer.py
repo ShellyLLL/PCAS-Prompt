@@ -15,7 +15,6 @@ from dataloader.data_utils import set_up_datasets, get_base_dataloader, get_new_
 from .pcas_modules import PCASViT
 from .pcas_losses import (
     build_prototype_cache,
-    leave_one_out_prototype_loss,
     sample_affinity_consistency,
     prototype_affinity_consistency,
     build_component_prototype_cache,
@@ -324,16 +323,10 @@ class PCASFSCILTrainer:
         return build_component_prototype_cache(features, labels, num_classes)
 
     def _base_optimizer(self):
-        prompt_params = [
-            p for p in self.model.pcas.parameters() if p.requires_grad
-        ]
+        prompt_params = [p for p in self.model.pcas.parameters() if p.requires_grad]
         return torch.optim.AdamW(
-            [
-                {"params": prompt_params,
-                 "lr": float(getattr(self.args, "pcas_lr", 1e-3))},
-                {"params": self.model.fc.parameters(),
-                 "lr": float(getattr(self.args, "pcas_head_lr", 1e-3))},
-            ],
+            prompt_params,
+            lr=float(getattr(self.args, "pcas_lr", 1e-3)),
             weight_decay=float(getattr(self.args, "pcas_weight_decay", 1e-4)),
         )
 
@@ -367,7 +360,7 @@ class PCASFSCILTrainer:
         for epoch in range(int(self.args.epochs_base)):
             sampler.set_epoch(epoch)
             self.model.train()
-            totals = {"total": 0.0, "ce": 0.0, "component_proto": 0.0,
+            totals = {"total": 0.0, "component_proto": 0.0,
                       "sample_aff": 0.0, "proto_aff": 0.0}
             warmup_epochs = int(getattr(self.args, "affinity_warmup_epochs", 10))
             warmup_progress = (
@@ -397,8 +390,6 @@ class PCASFSCILTrainer:
                 student_features, aux = self.model.encode_student(
                     images, return_aux=True
                 )
-                logits = self.model.classify_base(student_features)
-                loss_ce = F.cross_entropy(logits, labels)
                 loss_component_proto = leave_one_out_component_prototype_loss(
                     aux["component_features"], aux["component_weights"], labels,
                     indices, component_cache,
@@ -413,15 +404,13 @@ class PCASFSCILTrainer:
                     affinity_scale=float(getattr(self.args, "affinity_scale", 16.0))
                 )
 
-                lambda_component_proto = float(getattr(self.args, "lambda_component_proto", 0.5))
                 lambda_aff_target = float(
                     getattr(self.args, "lambda_affinity", 0.1)
                 )
                 lambda_aff = lambda_aff_target * warmup_progress
                 beta = float(getattr(self.args, "beta_affinity", 0.5))
                 loss = (
-                    loss_ce
-                    + lambda_component_proto * loss_component_proto
+                    loss_component_proto
                     + lambda_aff * (loss_sample + beta * loss_relation)
                 )
 
@@ -430,7 +419,6 @@ class PCASFSCILTrainer:
                 optimizer.step()
 
                 totals["total"] += float(loss.detach())
-                totals["ce"] += float(loss_ce.detach())
                 totals["component_proto"] += float(loss_component_proto.detach())
                 totals["sample_aff"] += float(loss_sample.detach())
                 totals["proto_aff"] += float(loss_relation.detach())

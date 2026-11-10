@@ -200,44 +200,6 @@ def leave_one_out_component_prototype_loss(
     return F.cross_entropy(logits * float(logit_scale), labels)
 
 
-def leave_one_out_prototype_loss(
-    student_features,
-    labels,
-    dataset_indices,
-    prototype_cache,
-    logit_scale=16.0,
-):
-    """Global-feature prototype CE with the current sample removed."""
-    labels = labels.long()
-    dataset_indices = dataset_indices.long()
-    cache_features = prototype_cache["features"]
-    cache_labels = prototype_cache["labels"]
-    class_sums = prototype_cache["class_sums"]
-    class_counts = prototype_cache["class_counts"]
-    prototypes = prototype_cache["prototypes"]
-
-    if not torch.equal(cache_labels[dataset_indices], labels):
-        raise ValueError("Batch labels do not match the indexed prototype cache.")
-    if torch.any(class_counts[labels] <= 1):
-        raise ValueError("Leave-one-out prototypes require at least two samples per class.")
-
-    loo_sums = class_sums[labels] - cache_features[dataset_indices]
-    loo_means = loo_sums / (class_counts[labels] - 1).to(
-        student_features.dtype
-    ).unsqueeze(1)
-    loo_prototypes = F.normalize(loo_means, p=2, dim=-1)
-
-    logits = student_features @ prototypes.t()
-    loo_target_logits = (student_features * loo_prototypes).sum(
-        dim=-1, keepdim=True
-    )
-    target_mask = F.one_hot(
-        labels, num_classes=prototypes.shape[0]
-    ).to(torch.bool)
-    logits = torch.where(target_mask, loo_target_logits, logits)
-    return F.cross_entropy(logits * float(logit_scale), labels)
-
-
 def sample_affinity_consistency(
     teacher_features,
     student_features,
@@ -390,22 +352,3 @@ def componentwise_prototype_calibration(
     weights = torch.stack(selected_weights, dim=1)
     indices = torch.stack(selected_indices, dim=1)
     return calibrated, weights, indices
-
-
-def teen_calibrate(novel_prototypes, base_prototypes, alpha=0.5, tau=16.0):
-    """Global TEEN calibration retained only as a comparison baseline."""
-    if not 0.0 <= alpha <= 1.0:
-        raise ValueError("TEEN alpha must be in [0, 1].")
-    if novel_prototypes.ndim != 2 or base_prototypes.ndim != 2:
-        raise ValueError("Prototype tensors must be rank-2.")
-    if novel_prototypes.shape[1] != base_prototypes.shape[1]:
-        raise ValueError("Novel and base prototypes must share one feature space.")
-
-    novel_prototypes = F.normalize(novel_prototypes, p=2, dim=-1)
-    base_prototypes = F.normalize(base_prototypes, p=2, dim=-1)
-    similarities = novel_prototypes @ base_prototypes.t()
-    weights = F.softmax(similarities * float(tau), dim=-1)
-    calibrated = (1.0 - float(alpha)) * novel_prototypes + float(alpha) * (
-        weights @ base_prototypes
-    )
-    return F.normalize(calibrated, p=2, dim=-1), weights

@@ -183,7 +183,6 @@ class PCASViT(nn.Module):
         self.mode = mode
         self.embed_dim = 768
         self.insert_after = int(getattr(args, "pcas_layer", 6))
-        self.temperature = float(getattr(args, "pcas_logit_scale", 16.0))
         self._incremental_frozen = False
 
         self.encoder = model_My.vit_base_patch16_224_in21k(
@@ -221,15 +220,12 @@ class PCASViT(nn.Module):
             residual_init=float(getattr(args, "residual_init", 0.1)),
             residual_max=float(getattr(args, "residual_max", 0.5)),
         )
-        self.fc = nn.Linear(self.embed_dim, int(args.base_class), bias=False)
-        nn.init.normal_(self.fc.weight, mean=0.0, std=0.02)
 
     def train(self, mode: bool = True):
         super().train(mode)
         self.encoder.eval()
         if self._incremental_frozen:
             self.pcas.eval()
-            self.fc.eval()
         return self
 
     @torch.no_grad()
@@ -289,15 +285,10 @@ class PCASViT(nn.Module):
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         return self.encode_student(images, return_aux=False)
 
-    def classify_base(self, features: torch.Tensor) -> torch.Tensor:
-        normalized_weight = F.normalize(self.fc.weight, p=2, dim=-1)
-        return self.temperature * F.linear(features, normalized_weight)
-
     def forward(self, images: torch.Tensor):
         features, auxiliary = self.encode_student(images, return_aux=True)
         return {
             "features": features,
-            "logit": self.classify_base(features),
             "component_features": auxiliary["component_features"],
             "component_weights": auxiliary["component_weights"],
             "residual_scale": auxiliary["residual_scale"],
@@ -307,7 +298,6 @@ class PCASViT(nn.Module):
         """Freeze all learned prompt and classifier parameters for real sessions."""
         self._incremental_frozen = True
         self.pcas.requires_grad_(False)
-        self.fc.requires_grad_(False)
         self.eval()
 
 
