@@ -457,7 +457,7 @@ class PCASFSCILTrainer:
         self.base_component_prototypes = final_components["prototypes"].detach()
         self.base_teacher_prototypes = teacher_cache["prototypes"].detach()
 
-        # The base prototypes are the ONLY base references used by TEEN.
+        # Store global fused prototypes for checkpoint diagnostics only.
         torch.save(
             {
                 "model": self.model.state_dict(),

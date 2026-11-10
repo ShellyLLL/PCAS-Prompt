@@ -88,7 +88,6 @@ Important PCAS defaults:
 | Classes per batch | 16 |
 | Samples per class | 4 |
 | Prompt learning rate | 1e-3 |
-| Component prototype loss weight | 0.5 |
 | Affinity loss weight | 0.1 |
 | Class-affinity coefficient | 0.5 |
 | Affinity temperature | 16 |
@@ -101,8 +100,8 @@ These are reproducible starting settings, not claimed dataset-wise optima.
 
 Runs are saved under `checkpoint/PCAS/<dataset>/<timestamp>/`:
 
-- `pcas_base.pth`: final frozen PCAS model, final student base prototypes, and teacher prototypes for audit.
-- `pcas_final.pth`: model, all class prototypes, session accuracies and summary.
+- `pcas_base.pth`: final frozen PCAS model, final component-wise base prototypes, and global teacher/student prototypes for diagnostics.
+- `pcas_final.pth`: model, all component-wise class prototypes, session accuracies and summary.
 - `results.txt`: per-epoch and per-session records.
 
 The summary reports mean session class-average accuracy (AA) and PD = base-session class-average accuracy minus final-session class-average accuracy. Each session also reports base/novel accuracy, their harmonic mean (HMean), novel-to-base error rate (TBR), attention-weighted component-prototype distance and component usage/attention-entropy diagnostics. TBR is the fraction of novel test examples predicted as base classes; it is not limited to semantically nearest base classes. Component usage and attention entropy are descriptive diagnostics, not proof by themselves that components are functionally distinct.
