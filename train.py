@@ -213,6 +213,8 @@ if __name__ == '__main__':
 
     if args.method == 'apl_prsn':
         trainer = importlib.import_module('models.%s.apl_prsn_trainer' % (args.project)).APLPRSNFSCILTrainer(args)
+    elif args.method == 'pcas':
+        trainer = importlib.import_module('models.%s.pcas_trainer' % (args.project)).PCASFSCILTrainer(args)
     elif args.method == 'prompt_slot_ot':
         trainer = importlib.import_module('models.%s.slot_ot_trainer' % (args.project)).PromptSlotOTFSCILTrainer(args)
     elif args.method == 'lsp_proto':
