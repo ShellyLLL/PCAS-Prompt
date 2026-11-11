@@ -16,8 +16,8 @@ def get_command_line_parser():
     parser.add_argument('-project', type=str, default=PROJECT)
     parser.add_argument('-dataroot', type=str, default=DATA_DIR)
     parser.add_argument('-out', type=str, default='PCAS')
-    parser.add_argument('--method', type=str, default='pcas', choices=['pcas', 'lsp_proto'],
-                        help='Select PCAS or LGSP-LSP prototype-based FSCIL.')
+    parser.add_argument('--method', type=str, default='pcas', choices=['pcas', 'lsp_proto', 'prompt_slot_ot'],
+                        help='Select PCAS, legacy LSP baseline, or Prompt-Slot-OT FSCIL.')
     parser.add_argument('--lsp_pool_size', type=int, default=30)
     parser.add_argument('--lsp_top_k', type=int, default=10)
     parser.add_argument('--lsp_hidden_dim', type=int, default=3)
@@ -28,6 +28,26 @@ def get_command_line_parser():
     parser.add_argument('--lsp_lr', type=float, default=2e-4)
     parser.add_argument('--lsp_weight_decay', type=float, default=1e-4)
     parser.add_argument('--lsp_logit_scale', type=float, default=16.0)
+    parser.add_argument('--slot_dim', type=int, default=256)
+    parser.add_argument('--slot_num_slots', type=int, default=6)
+    parser.add_argument('--slot_iterations', type=int, default=2)
+    parser.add_argument('--slot_classes_per_episode', type=int, default=12)
+    parser.add_argument('--slot_support_per_class', type=int, default=2)
+    parser.add_argument('--slot_query_per_class', type=int, default=2)
+    parser.add_argument('--slot_lr', type=float, default=2e-4)
+    parser.add_argument('--slot_weight_decay', type=float, default=1e-4)
+    parser.add_argument('--slot_memory_size', type=int, default=6)
+    parser.add_argument('--slot_calibration_alpha', type=float, default=0.25)
+    parser.add_argument('--slot_calibration_topk', type=int, default=5)
+    parser.add_argument('--slot_global_retrieval_temperature', type=float, default=0.05)
+    parser.add_argument('--slot_match_temperature', type=float, default=0.20)
+    parser.add_argument('--slot_ot_epsilon', type=float, default=0.05)
+    parser.add_argument('--slot_ot_tau', type=float, default=0.10)
+    parser.add_argument('--slot_ot_iterations', type=int, default=20)
+    parser.add_argument('--slot_unmatched_penalty', type=float, default=0.25)
+    parser.add_argument('--slot_temperature', type=float, default=0.10)
+    parser.add_argument('--slot_global_weight', type=float, default=0.5)
+    parser.add_argument('--slot_out', type=str, default='PromptSlotOT')
     parser.add_argument('--index_list_root', type=str,
                         default=os.environ.get("FSCIL_INDEX_LIST_ROOT"),
                         help='Session split root. Defaults to <dataroot>/index_list.')
@@ -224,7 +244,9 @@ if __name__ == '__main__':
     pprint(vars(args))
     args.num_gpu = set_gpu(args)
 
-    if args.method == 'lsp_proto':
+    if args.method == 'prompt_slot_ot':
+        trainer = importlib.import_module('models.%s.slot_ot_trainer' % (args.project)).PromptSlotOTFSCILTrainer(args)
+    elif args.method == 'lsp_proto':
         trainer = importlib.import_module('models.%s.lsp_fscil_trainer' % (args.project)).LSPPrototypeFSCILTrainer(args)
     elif args.vit:
         if args.baseline:
