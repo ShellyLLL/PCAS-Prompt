@@ -48,7 +48,8 @@ The same method entry supports CIFAR-100, MiniImageNet, FGVC-Aircraft, and iNF20
 | Samples per base class per batch | 4 |
 | APL/PRSN learning rate | 2e-4 |
 | Global/local inference weights | 0.5 / 0.5 |
-| PRSN logit scale | 16 |\n| Streaming evaluation batch size | 8 |
+| PRSN logit scale | 16 |
+| Streaming evaluation batch size | 8 |
 
 These are initial experimental settings, not claims of optimality. Tune using base-class validation only.
 
