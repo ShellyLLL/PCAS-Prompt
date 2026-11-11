@@ -1,68 +1,69 @@
-# Prompt-Slot-OT for Few-Shot Class-Incremental Learning
+# APL-PRSN for Few-Shot Class-Incremental Learning
 
-This branch contains a unified FSCIL method built around **frozen ViT Patch features, Prompt-guided Slot Attention, permutation-invariant local-set matching, and reliability-controlled local prototype calibration**.
+This branch's default method is a unified **APL + PRSN** architecture. It uses the repository's existing ImageNet-21K pretrained ViT-B/16 and preserves the original FSCIL dataset/session loaders.
 
-The method is intentionally kept compact. It does not use the legacy PCAS component bank, LSP image-space prompt pool, CODA prompt expansion, MoE, text encoders, replay, or incremental prompt tuning as part of the new method. Legacy implementations remain available as separate baselines; run the new method explicitly with \`--method prompt_slot_ot\`.
+## Unified architecture
 
-## Method
+1. **Frozen visual backbone.** The ImageNet-21K ViT-B/16 remains frozen in every session. Its final-block CLS-to-Patch attention is reused as an APL prior; no DINO checkpoint or second backbone is introduced.
+2. **APL shared part learning.** A fixed set of learnable part queries attends to per-image Patch priors. The queries induce hard Patch-to-part assignments and produce an unordered set of aligned local part descriptors. No additional Transformer tokens or independent Slot Attention module is used.
+3. **PRSN global branch.** Global class prototypes are refined with a learnable prototype self-attention module.
+4. **PRSN local branch (PFRSM).** Novel/local prototypes retrieve semantically similar base-class part memories and reconstruct local prototypes with query-conditioned attention. Cross-image semantic alignment (CISA) aligns global and local branch predictions for distinct images of the same class.
+5. **Joint classifier.** Global cosine-prototype logits and query-conditioned local reconstruction logits are combined with fixed, explicit weights.
+6. **Strict FSCIL update.** Base training learns APL and PRSN only. At each incremental session, the backbone, APL, and PRSN are frozen. Exactly the real K-shot support samples form each novel prototype. Calibration retrieves from the immutable base memory only. Old class prototypes are append-only and are never rewritten; test images/labels are used only for evaluation.
 
-1. **Frozen visual backbone.** A pretrained ViT-B/16 provides a global CLS representation and a set of Patch features. The backbone remains frozen.
-2. **Prompt-Slot decomposition.** Shared learned slot queries attend to the Patch set. Competitive Patch assignment and GRU slot updates produce an image-conditioned, unordered set of local visual descriptors. Slot indices are not treated as semantic labels.
-3. **Cross-image set matching.** Local descriptor sets are compared with unbalanced entropic optimal transport. Unmatched mass is allowed, so occluded, absent, or unreliable regions are not forced into a correspondence.
-4. **Cross-class recomposition.** Base classes retain a compact set of local visual descriptors. A novel class retrieves candidate base memories using global similarity, then receives only confidence-weighted local corrections supported by OT matching.
-5. **Joint classification.** All seen classes are evaluated with a common combination of global cosine distance and local-set OT distance.
+The APL prior is deliberately adapted to the available ViT: final-block CLS-to-Patch attention is extracted from the same frozen ImageNet-21K encoder. This is not a claim to reproduce a DINO-based prior.
 
-## Base and incremental protocol
+## Base training objectives
 
-- Base training uses class-balanced episodes with disjoint support and query examples. Only the Slot Attention module is optimized; the ViT is frozen.
-- Episode classification uses the same global-plus-local distance used at inference.
-- After base training, deterministic base features are compressed into per-class local descriptor memories and global class prototypes.
-- In each real FSCIL session, exactly the configured K-shot support examples are used to construct each novel class prototype.
-- Novel local memories may be calibrated from the **fixed base-class memory only**. Calibrated novel memories are not reused as transfer sources, preventing recursive error propagation.
-- ViT and Slot Attention are frozen during all incremental sessions. Existing class prototypes are append-only and never modified.
+- Leave-one-out global prototype classification.
+- Leave-one-out PRSN local reconstruction classification.
+- PRSN cross-image semantic alignment (CISA).
+- APL all-min contrastive part learning.
+- APL part-diversity regularization.
 
-## Run
+The leave-one-out construction excludes each training sample from its own class prototype to prevent self-match leakage. Class-balanced batches contain multiple classes and multiple images per class.
 
-The existing dataset/session protocol is retained. Example for CUB-200:
+## Run CUB-200
 
-\`\`\`bash
+```bash
 export FSCIL_DATA_ROOT=/data/lx/fscil/data
 export FSCIL_INDEX_LIST_ROOT="$FSCIL_DATA_ROOT/index_list"
 
-python train.py --method prompt_slot_ot -project base -dataset cub200 -vit \\
-  -dataroot "$FSCIL_DATA_ROOT" -gpu 0 -seed 1 \\
-  -epochs_base 50 -num_workers 4 -test_batch_size 64
-\`\`\`
+python train.py --method apl_prsn -project base -dataset cub200 -vit \
+  -dataroot "$FSCIL_DATA_ROOT" --index_list_root "$FSCIL_INDEX_LIST_ROOT" \
+  -gpu 0 -seed 1 -epochs_base 50 -num_workers 4 -test_batch_size 64
+```
 
-The same method entry supports the repository's existing CIFAR-100, MiniImageNet, FGVC-Aircraft, and iNF200 loaders, subject to their original split files and data layouts.
+The same method entry supports CIFAR-100, MiniImageNet, FGVC-Aircraft, and iNF200 subject to the repository's original dataset/session split files and directory layouts.
 
-### Main settings
+## Main settings
 
 | Setting | Default |
 |---|---:|
-| Slot count | 6 |
-| Slot dimension | 256 |
-| Slot update iterations | 2 |
-| Classes per base episode | 12 |
-| Support / query per episode class | 2 / 2 |
-| Local memory descriptors per class | 6 |
-| Slot learning rate | 2e-4 |
-| Maximum novel-memory calibration | 0.25 |
-| OT entropy regularization | 0.05 |
-| OT marginal relaxation | 0.10 |
-| Global/local classification weight | 0.5 / 0.5 |
+| Shared APL part queries | 6 |
+| APL prior top fraction | 0.20 |
+| APL hard-assignment temperature | 0.20 |
+| PRSN base-memory top-k | 5 |
+| Base batch classes | 16 |
+| Samples per base class per batch | 4 |
+| APL/PRSN learning rate | 2e-4 |
+| Global/local inference weights | 0.5 / 0.5 |
+| PRSN logit scale | 16 |
 
-These are starting values, not claims of optimality. Select settings using base-class validation only.
+These are initial experimental settings, not claims of optimality. Tune using base-class validation only.
 
 ## Implementation
 
-- \`models/base/slot_ot_modules.py\`: frozen ViT and Prompt-Slot Attention.
-- \`models/base/slot_ot_losses.py\`: unbalanced Sinkhorn matching, local-memory compression, calibration, and joint classifier.
-- \`models/base/slot_ot_trainer.py\`: base episodic training, memory construction, real incremental sessions, evaluation, and checkpoints.
-- \`tests/test_slot_ot.py\`: shape, gradient, permutation-invariance, OT, calibration, and frozen-backbone contract tests.
+- `models/base/apl_prsn_modules.py`: frozen ViT, APL shared part prompts, PRSN global refiner and PFRSM.
+- `models/base/apl_prsn_losses.py`: class/leave-one-out prototypes, APL all-min and diversity losses, PRSN CISA, cosine classifier.
+- `models/base/apl_prsn_trainer.py`: base training, immutable base memory, real K-shot incremental updates, evaluation and AA/PD reporting.
+- `models/base/ViT_fscil_trainer.py`: compatibility entry point routed to APL-PRSN.
+- `tests/test_apl_prsn.py`: tensor shape, gradients, leave-one-out, calibration, frozen-backbone and incremental immutability tests.
 
-## Evaluation and limitations
+The previous PCAS, LSP and Prompt-Slot-OT files are retained as historical/explicit baselines only. They are not part of the default APL-PRSN computation graph.
 
-The trainer reports session sample accuracy, session class-average accuracy, base/novel accuracy, harmonic mean, novel-to-base error, task-wise accuracy, AA, and PD. AA is the mean class-average accuracy over evaluated sessions. PD is base-session class-average accuracy minus final-session class-average accuracy.
+## Evaluation
 
-The implementation is not evidence of an accuracy improvement until it has been run on the full FSCIL protocols with multiple seeds. In particular, verify that local-set matching improves novel-class accuracy without increasing base-class degradation. Report compute cost and compare against the repository's unchanged baselines under identical data splits and seeds.
+The trainer reports session sample accuracy, class-average accuracy, base/novel accuracy, harmonic mean, novel-to-base error, task-wise accuracy, AA (mean session class-average accuracy) and PD (base-session class-average accuracy minus final-session class-average accuracy).
+
+A successful unit-test run does not establish an accuracy improvement. Full FSCIL experiments with identical splits and multiple seeds are required before making performance claims.

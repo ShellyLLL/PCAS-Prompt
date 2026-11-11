@@ -1,6 +1,6 @@
-"""PCAS network entry point retained for compatibility with FSCIL imports."""
-from .pcas_modules import PCASViT
+"""Unified APL-PRSN ViT network entry point."""
+from .apl_prsn_modules import APLPRSNViT
 
-ViT_MYNET = PCASViT
+ViT_MYNET = APLPRSNViT
 
-__all__ = ["ViT_MYNET", "PCASViT"]
+__all__ = ["ViT_MYNET", "APLPRSNViT"]
