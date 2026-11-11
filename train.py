@@ -56,6 +56,7 @@ def get_command_line_parser():
     parser.add_argument('-batch_size_base', type=int, default=64)
     parser.add_argument('-batch_size_new', type=int, default=0, help='set 0 will use all the availiable training image for new')
     parser.add_argument('-test_batch_size', type=int, default=128)
+    parser.add_argument('--apl_eval_batch_size', type=int, default=8,\n                        help='Per-device batch size for streaming APL-PRSN evaluation.')
     parser.add_argument('-base_mode', type=str, default='ft_cos',
                         choices=['ft_dot', 'ft_cos']) # ft_dot means using linear classifier, ft_cos means using cosine classifier
     parser.add_argument('-new_mode', type=str, default='avg_cos',

@@ -561,39 +561,96 @@ class APLPRSNFSCILTrainer:
 
     @torch.no_grad()
     def _evaluate(self, testset, seen_classes, session):
-        global_features, parts, part_valid, labels = self._extract_features(testset)
-        validate_seen_class_coverage(labels, seen_classes, session)
+        """Evaluate in bounded batches; never materialize test-set x class x part tensors."""
         if self.all_global_prototypes.shape[0] != int(seen_classes):
             raise RuntimeError("Global prototype count does not match seen classes.")
         if self.all_local_prototypes.shape[0] != int(seen_classes):
             raise RuntimeError("Local prototype count does not match seen classes.")
 
+        original_transform = getattr(testset, "transform", None)
+        if original_transform is None:
+            raise RuntimeError(
+                "The evaluation dataset must expose a transform for deterministic extraction."
+            )
+
+        eval_batch_size = int(getattr(self.args, "apl_eval_batch_size", 8))
+        if eval_batch_size < 1:
+            raise ValueError("apl_eval_batch_size must be >= 1.")
+
         logit_scale = float(getattr(self.args, "prsn_logit_scale", 16.0))
-        global_logits = cosine_prototype_logits(
-            global_features, self.all_global_prototypes, logit_scale
-        )
-        local_logits = self.model.prsn.pfrsm.local_logits(
-            parts,
-            part_valid,
-            self.all_local_prototypes,
-            self.all_local_valid,
-            logit_scale=logit_scale,
-        )
         global_weight = float(getattr(self.args, "joint_global_weight", 0.5))
         local_weight = float(getattr(self.args, "joint_local_weight", 0.5))
         weight_sum = global_weight + local_weight
         if global_weight < 0 or local_weight < 0 or weight_sum <= 0:
             raise ValueError("Joint global/local classification weights are invalid.")
-        logits = (
-            global_weight * global_logits + local_weight * local_logits
-        ) / weight_sum
 
-        predictions = logits.argmax(dim=1)
+        # Stream images through the frozen ViT and PRSN classifier. Only CPU
+        # predictions/labels are retained; no [N_test, C, T, D] tensor exists.
+        testset.transform = self._make_eval_transform()
+        loader = self._loader(
+            testset,
+            batch_size=eval_batch_size,
+            shuffle=False,
+        )
+        self.model.eval()
+        prediction_chunks = []
+        label_chunks = []
+        try:
+            for images, batch_labels in tqdm(
+                loader,
+                desc="APL-PRSN chunked evaluation session {}".format(session),
+            ):
+                images = images.to(self.device, non_blocking=True)
+                labels = torch.as_tensor(
+                    batch_labels, dtype=torch.long, device=self.device
+                )
+
+                output = self.model(images)
+                global_logits = cosine_prototype_logits(
+                    output["global_features"],
+                    self.all_global_prototypes,
+                    logit_scale,
+                )
+                local_logits = self.model.prsn.pfrsm.local_logits(
+                    output["parts"],
+                    output["part_valid"],
+                    self.all_local_prototypes,
+                    self.all_local_valid,
+                    logit_scale=logit_scale,
+                )
+                logits = (
+                    global_weight * global_logits + local_weight * local_logits
+                ) / weight_sum
+
+                # Move only compact results to CPU before the next chunk.
+                prediction_chunks.append(logits.argmax(dim=1).cpu())
+                label_chunks.append(labels.cpu())
+
+                del output, global_logits, local_logits, logits, images, labels
+        finally:
+            testset.transform = original_transform
+
+        if not label_chunks:
+            raise RuntimeError("Cannot evaluate an empty test dataset.")
+
+        predictions = torch.cat(prediction_chunks, dim=0)
+        labels = torch.cat(label_chunks, dim=0)
+        validate_seen_class_coverage(labels, seen_classes, session)
+
         accuracy = float((predictions == labels).float().mean().item())
-        class_accuracy = float(torch.stack([
-            (predictions[labels == class_id] == class_id).float().mean()
-            for class_id in range(int(seen_classes))
-        ]).mean().item())
+        per_class_accuracy = []
+        for class_id in range(int(seen_classes)):
+            class_mask = labels == class_id
+            if not class_mask.any():
+                raise RuntimeError(
+                    "Session {} evaluation is missing class {}.".format(
+                        session, class_id
+                    )
+                )
+            per_class_accuracy.append(
+                (predictions[class_mask] == labels[class_mask]).float().mean()
+            )
+        class_accuracy = float(torch.stack(per_class_accuracy).mean().item())
 
         base_mask = labels < int(self.args.base_class)
         novel_mask = labels >= int(self.args.base_class)
@@ -625,6 +682,7 @@ class APLPRSNFSCILTrainer:
             "task_wise_accuracy": compute_taskwise_accuracy(
                 labels, predictions, self.args.base_class, self.args.way, session
             ),
+            "evaluation_batch_size": eval_batch_size,
         }
 
     @torch.no_grad()

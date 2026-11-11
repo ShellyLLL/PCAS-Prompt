@@ -48,7 +48,7 @@ The same method entry supports CIFAR-100, MiniImageNet, FGVC-Aircraft, and iNF20
 | Samples per base class per batch | 4 |
 | APL/PRSN learning rate | 2e-4 |
 | Global/local inference weights | 0.5 / 0.5 |
-| PRSN logit scale | 16 |
+| PRSN logit scale | 16 |\n| Streaming evaluation batch size | 8 |
 
 These are initial experimental settings, not claims of optimality. Tune using base-class validation only.
 
@@ -64,6 +64,6 @@ The previous PCAS, LSP and Prompt-Slot-OT files are retained as historical/expli
 
 ## Evaluation
 
-The trainer reports session sample accuracy, class-average accuracy, base/novel accuracy, harmonic mean, novel-to-base error, task-wise accuracy, AA (mean session class-average accuracy) and PD (base-session class-average accuracy minus final-session class-average accuracy).
+Evaluation streams test images through the frozen ViT and PRSN classifier in bounded batches (default `--apl_eval_batch_size 8`); only predictions and labels are retained on CPU. This avoids materializing a full test-set-by-class-by-part reconstruction tensor. The trainer reports session sample accuracy, class-average accuracy, base/novel accuracy, harmonic mean, novel-to-base error, task-wise accuracy, AA (mean session class-average accuracy) and PD (base-session class-average accuracy minus final-session class-average accuracy).
 
 A successful unit-test run does not establish an accuracy improvement. Full FSCIL experiments with identical splits and multiple seeds are required before making performance claims.
