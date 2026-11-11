@@ -159,7 +159,7 @@ class TestPRSN(unittest.TestCase):
         self.assertEqual(tuple(calibrated.shape), (2, 4, 16))
         self.assertEqual(tuple(calibrated_valid.shape), (2, 4))
         self.assertEqual(tuple(selected.shape), (2, 2))
-        self.assertTrue(torch.allclose(weights.sum(1), torch.ones(2), atol=1e-6))
+        self.assertTrue(torch.allclose(weights.sum(1), torch.ones(2, 4), atol=1e-6))
         logits = module.local_logits(
             novel_parts, novel_valid, calibrated, calibrated_valid
         )
