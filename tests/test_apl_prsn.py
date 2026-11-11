@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from models.base.apl_prsn_modules import (
     APLPartPrompt,
+    APLPRSNViT,
     GlobalPrototypeRefiner,
     PrototypeFeatureResynthesis,
 )
@@ -48,6 +49,79 @@ class TestAPLPartLearning(unittest.TestCase):
         self.assertTrue(torch.isfinite(all_min))
         self.assertTrue(torch.isfinite(diversity))
         (all_min + diversity).backward()
+
+
+    def test_full_model_freezes_backbone_and_incremental_modules(self):
+        class FakePatchEmbed(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(3, 24)
+
+            def forward(self, images):
+                pooled = F.adaptive_avg_pool2d(images, (4, 4))
+                return self.proj(pooled.flatten(2).transpose(1, 2))
+
+        class FakeAttention(nn.Module):
+            def __init__(self, dim=24, heads=4):
+                super().__init__()
+                self.num_heads = heads
+                self.scale = (dim // heads) ** -0.5
+                self.qkv = nn.Linear(dim, dim * 3)
+                self.proj = nn.Linear(dim, dim)
+
+            def forward(self, tokens):
+                batch, count, dim = tokens.shape
+                qkv = self.qkv(tokens).reshape(
+                    batch, count, 3, self.num_heads, dim // self.num_heads
+                ).permute(2, 0, 3, 1, 4)
+                q, k, v = qkv.unbind(0)
+                attention = ((q @ k.transpose(-2, -1)) * self.scale).softmax(-1)
+                output = (attention @ v).transpose(1, 2).reshape(batch, count, dim)
+                return self.proj(output)
+
+        class FakeBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.norm1 = nn.LayerNorm(24)
+                self.attn = FakeAttention()
+
+            def forward(self, tokens):
+                return tokens + self.attn(self.norm1(tokens))
+
+        class FakeEncoder(nn.Module):
+            num_features = 24
+
+            def __init__(self):
+                super().__init__()
+                self.patch_embed = FakePatchEmbed()
+                self.cls_token = nn.Parameter(torch.zeros(1, 1, 24))
+                self.pos_embed = nn.Parameter(torch.zeros(1, 17, 24))
+                self.blocks = nn.ModuleList([FakeBlock(), FakeBlock()])
+                self.norm = nn.LayerNorm(24)
+
+            def _pos_embed(self, patches):
+                tokens = torch.cat([
+                    self.cls_token.expand(patches.shape[0], -1, -1), patches
+                ], dim=1)
+                return tokens + self.pos_embed
+
+        class Args:
+            apl_num_parts = 4
+            apl_num_heads = 4
+            apl_prior_ratio = 0.25
+            apl_temperature = 0.2
+            prsn_top_k = 2
+
+        model = APLPRSNViT(Args(), encoder=FakeEncoder())
+        output = model(torch.randn(2, 3, 224, 224))
+        self.assertEqual(tuple(output["global_features"].shape), (2, 24))
+        self.assertEqual(tuple(output["parts"].shape), (2, 4, 24))
+        self.assertTrue(all(not p.requires_grad for p in model.backbone.parameters()))
+        self.assertTrue(any(p.requires_grad for p in model.apl.parameters()))
+        self.assertTrue(any(p.requires_grad for p in model.prsn.parameters()))
+        model.freeze_for_incremental()
+        self.assertTrue(all(not p.requires_grad for p in model.apl.parameters()))
+        self.assertTrue(all(not p.requires_grad for p in model.prsn.parameters()))
 
 
 class TestPRSN(unittest.TestCase):
