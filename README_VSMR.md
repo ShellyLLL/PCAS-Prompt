@@ -4,7 +4,7 @@ The default method on \`dev\` is VSMR. The unified implementation is developed f
 
 ## 0. Frozen-backbone preprocessing contract
 
-VSMR reads the mean, standard deviation, interpolation mode, and crop percentage from the instantiated pretrained ViT checkpoint configuration. The same transform is applied when extracting base-training features, building the base memory, extracting incremental support features, and evaluating seen classes. Dataset-specific CIFAR/ImageNet normalization is not substituted for the checkpoint's input statistics.
+VSMR reads the mean, standard deviation, interpolation mode, and crop percentage from the instantiated pretrained ViT checkpoint configuration. Base-session training retains random resized-crop and horizontal-flip augmentation, but uses the checkpoint's interpolation and normalization. Base-memory extraction, incremental support extraction, and evaluation use the corresponding deterministic resize/center-crop transform with the same checkpoint statistics. Dataset-specific CIFAR/ImageNet normalization is never substituted for the checkpoint's input statistics.
 
 For the repository's ImageNet-21K ViT-B/16 configuration, the input mean/std and resize/crop policy follow that checkpoint's timm metadata. If a checkpoint does not expose valid RGB statistics, VSMR uses the explicit fallback mean/std of 0.5/0.5 and validates the resulting transform.
 

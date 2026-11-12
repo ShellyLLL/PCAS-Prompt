@@ -156,29 +156,45 @@ class VSMRFSCILTrainer:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-    def _transform(self):
-        # All datasets and all FSCIL sessions must use the preprocessing
-        # associated with the exact frozen pretrained ViT checkpoint.
-        backbone = self.model.backbone
-        interpolation_names = {
+    def _input_interpolation(self):
+        names = {
             "nearest": transforms.InterpolationMode.NEAREST,
             "bilinear": transforms.InterpolationMode.BILINEAR,
             "bicubic": transforms.InterpolationMode.BICUBIC,
             "lanczos": transforms.InterpolationMode.LANCZOS,
         }
-        interpolation = interpolation_names.get(
-            str(backbone.input_interpolation).lower()
+        interpolation = names.get(
+            str(self.model.backbone.input_interpolation).lower()
         )
         if interpolation is None:
             raise ValueError(
                 "Unsupported ViT checkpoint interpolation: {}".format(
-                    backbone.input_interpolation
+                    self.model.backbone.input_interpolation
                 )
             )
+        return interpolation
+
+    def _transform(self):
+        # Deterministic checkpoint-aligned preprocessing for memory building,
+        # incremental support extraction, and all evaluation sessions.
+        backbone = self.model.backbone
         resize_size = int(round(224.0 / float(backbone.input_crop_pct)))
         return transforms.Compose([
-            transforms.Resize(resize_size, interpolation=interpolation),
+            transforms.Resize(resize_size, interpolation=self._input_interpolation()),
             transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(backbone.input_mean, backbone.input_std),
+        ])
+
+    def _training_transform(self):
+        # Preserve image augmentation in the base session, but never use
+        # dataset-specific normalization that conflicts with frozen ViT weights.
+        backbone = self.model.backbone
+        return transforms.Compose([
+            transforms.RandomResizedCrop(
+                224, interpolation=self._input_interpolation()
+            ),
+            transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(backbone.input_mean, backbone.input_std),
         ])
@@ -357,6 +373,10 @@ class VSMRFSCILTrainer:
         )
 
     def _train_base(self, trainset):
+        # Replace legacy dataset transforms before creating the DataLoader:
+        # training augmentation is retained, while normalization/interpolation
+        # are now tied to the frozen ViT checkpoint.
+        trainset.transform = self._training_transform()
         labels = np.asarray(trainset.targets, dtype=np.int64)
         if not np.array_equal(np.unique(labels), np.arange(int(self.args.base_class))):
             raise RuntimeError("Base labels must be contiguous [0, base_class).")

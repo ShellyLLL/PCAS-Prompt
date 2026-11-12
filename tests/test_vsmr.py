@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import transforms
 
 from models.base.vsmr_losses import (
     attention_overlap_loss,
@@ -24,6 +25,7 @@ from models.base.vsmr_resynthesis import (
     component_support_variance,
     compose_novel_prototypes,
     local_leave_one_out_query_logits,
+    query_conditioned_fixed_index_reconstruction,
     query_conditioned_reconstruction,
 )
 from models.base.vsmr_modules import (
@@ -279,6 +281,23 @@ class TestPrototypeAndTransfer(unittest.TestCase):
             float(reconstructor.value_projection.weight.grad.abs().sum()), 0.0
         )
 
+    def test_fixed_index_ablation_uses_same_query_reconstruction(self):
+        query = F.normalize(torch.randn(2, 4, 8), dim=-1).requires_grad_()
+        patches = F.normalize(torch.randn(2, 9, 8), dim=-1).requires_grad_()
+        prototypes = F.normalize(torch.randn(3, 4, 8), dim=-1)
+        reconstructor = QueryConditionedReconstructor(embed_dim=8)
+        scores, reconstructed, attention = query_conditioned_fixed_index_reconstruction(
+            query, patches, prototypes, reconstructor, scale=16.0
+        )
+        self.assertEqual(scores.shape, (2, 3))
+        self.assertEqual(reconstructed.shape, (2, 3, 4, 8))
+        self.assertEqual(attention.shape, (2, 3, 4, 9))
+        self.assertTrue(torch.isfinite(scores).all())
+        (-scores.mean()).backward()
+        self.assertIsNotNone(query.grad)
+        self.assertIsNotNone(patches.grad)
+        self.assertIsNotNone(reconstructor.value_projection.weight.grad)
+
     def test_local_loo_uses_same_query_reconstruction_path(self):
         parts = F.normalize(torch.randn(6, 4, 8), dim=-1).requires_grad_()
         patches = F.normalize(torch.randn(6, 10, 8), dim=-1).requires_grad_()
@@ -332,6 +351,34 @@ class TestPrototypeAndTransfer(unittest.TestCase):
             parameter.grad is not None and parameter.grad.abs().sum() > 0
             for parameter in reconstructor.parameters()
         ))
+
+
+class TestPreprocessingContract(unittest.TestCase):
+    def test_transform_uses_frozen_backbone_config_for_every_dataset(self):
+        trainer = VSMRFSCILTrainer.__new__(VSMRFSCILTrainer)
+        trainer.args = SimpleNamespace(dataset="cifar100")
+        trainer.model = SimpleNamespace(backbone=SimpleNamespace(
+            input_mean=(0.5, 0.5, 0.5),
+            input_std=(0.5, 0.5, 0.5),
+            input_interpolation="bicubic",
+            input_crop_pct=0.9,
+        ))
+        transform = trainer._transform()
+        resize, crop, to_tensor, normalize = transform.transforms
+        self.assertEqual(resize.size, 249)
+        self.assertEqual(resize.interpolation, transforms.InterpolationMode.BICUBIC)
+        self.assertEqual(crop.size, (224, 224))
+        self.assertEqual(normalize.mean, (0.5, 0.5, 0.5))
+        self.assertEqual(normalize.std, (0.5, 0.5, 0.5))
+
+        training_transform = trainer._training_transform()
+        train_normalize = training_transform.transforms[-1]
+        self.assertEqual(
+            training_transform.transforms[0].interpolation,
+            transforms.InterpolationMode.BICUBIC,
+        )
+        self.assertEqual(train_normalize.mean, (0.5, 0.5, 0.5))
+        self.assertEqual(train_normalize.std, (0.5, 0.5, 0.5))
 
 
 class TestTrainingDataPipeline(unittest.TestCase):
