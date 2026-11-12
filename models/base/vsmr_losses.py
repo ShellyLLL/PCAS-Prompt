@@ -98,7 +98,7 @@ def leave_one_out_global(features, labels):
 
 
 def local_leave_one_out_logits(parts, labels, epsilon=0.05, iterations=30,
-                               logit_scale=16.0):
+                               logit_scale=16.0, barycenter_iterations=5):
     """Query-conditioned local logits against OT class barycenters.
 
     The target-class barycenter excludes the query. Other class barycenters
@@ -118,7 +118,8 @@ def local_leave_one_out_logits(parts, labels, epsilon=0.05, iterations=30,
         raise ValueError("Each class requires at least two samples for local LOO.")
     full_prototypes = {
         int(cls): ot_barycenter(
-            parts[indices], epsilon, iterations, outer_iterations=3
+            parts[indices], epsilon, iterations,
+            outer_iterations=barycenter_iterations
         )
         for cls, indices in class_indices.items()
     }
@@ -134,7 +135,8 @@ def local_leave_one_out_logits(parts, labels, epsilon=0.05, iterations=30,
             if cls_id == own_class:
                 retained = indices[indices != sample_index]
                 prototype = ot_barycenter(
-                    parts[retained], epsilon, iterations, outer_iterations=3
+                    parts[retained], epsilon, iterations,
+                    outer_iterations=barycenter_iterations
                 )
             else:
                 prototype = full_prototypes[cls_id]
