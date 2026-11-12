@@ -475,7 +475,9 @@ class VSMRFSCILTrainer:
         support_labels = np.asarray(support_set.targets, dtype=np.int64)
         validate_exact_shot(support_labels, expected, int(self.args.shot), session)
         self._audit_support_test_paths(support_set, testset, session)
-        old_global, old_parts = self.all_global.clone(), self.all_parts.clone()
+        old_global = self.all_global.clone()
+        old_parts = self.all_parts.clone()
+        old_raw_parts = self.all_raw_parts.clone()
         global_features, parts, labels = self._extract(support_set)
         new_global, new_parts = [], []
         for cls in expected:
@@ -505,6 +507,8 @@ class VSMRFSCILTrainer:
             raise RuntimeError("Append-only contract violated: old global memory changed.")
         if not torch.equal(self.all_parts[:old_parts.shape[0]], old_parts):
             raise RuntimeError("Append-only contract violated: old local memory changed.")
+        if not torch.equal(self.all_raw_parts[:old_raw_parts.shape[0]], old_raw_parts):
+            raise RuntimeError("Append-only contract violated: old raw local memory changed.")
         metrics = self._evaluate(testset, base_class + session * way, session)
         metrics.update({
             "transfer_alpha_mean": float(alpha.mean()),
