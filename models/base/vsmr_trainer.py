@@ -410,8 +410,8 @@ class VSMRFSCILTrainer:
         macro = class_average_accuracy(labels, predictions, seen_classes)
         base_mask = labels < int(self.args.base_class)
         novel_mask = ~base_mask
-        base_acc = float((predictions[base_mask] == labels[base_mask]).float().mean()) if base_mask.any() else float("nan")
-        novel_acc = float((predictions[novel_mask] == labels[novel_mask]).float().mean()) if novel_mask.any() else float("nan")
+        base_acc = float((predictions[base_mask] == labels[base_mask]).float().mean()) if base_mask.any() else None
+        novel_acc = float((predictions[novel_mask] == labels[novel_mask]).float().mean()) if novel_mask.any() else None
         metrics = {
             "stage": "evaluation", "session": int(session),
             "sample_accuracy": accuracy, "class_average_accuracy": macro,
