@@ -43,7 +43,7 @@ def compose_novel_prototypes(novel_parts, base_bank, top_r=5,
     bank = F.normalize(base_bank, dim=-1)
     if bank.shape[0] == 0:
         empty = novel.new_zeros(novel.shape[:2])
-        return novel, empty, empty, novel.new_zeros(novel.shape[:2])
+        return novel, empty, empty, novel.new_zeros(novel.shape[:2]), novel.new_zeros(novel.shape[0], novel.shape[1], 0)
 
     similarities = torch.einsum("ckd,md->ckm", novel, bank)
     count = min(int(top_r), bank.shape[0])
@@ -71,7 +71,7 @@ def compose_novel_prototypes(novel_parts, base_bank, top_r=5,
         + alpha.unsqueeze(-1) * transferred,
         dim=-1,
     )
-    return composed, alpha, reliability, indices
+    return composed, alpha, reliability, indices, weights
 
 
 def query_conditioned_reconstruction(query_parts, class_parts,
