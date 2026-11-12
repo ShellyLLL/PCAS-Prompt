@@ -17,7 +17,8 @@ from dataloader.data_utils import (
 from .vsmr_modules import VSMRViT
 from .vsmr_losses import (
     attention_overlap_loss, cross_image_semantic_alignment,
-    global_logits, leave_one_out_global, local_leave_one_out_logits,
+    fixed_index_component_logits, global_logits, leave_one_out_global,
+    local_leave_one_out_logits,
     local_logits, ot_barycenter,
 )
 from .vsmr_resynthesis import (
@@ -403,8 +404,7 @@ class VSMRFSCILTrainer:
 
                 # Controlled ablations use the same query, global branch and
                 # classifier weights; only transfer or matching is removed.
-                fixed = (F.normalize(qp, dim=-1) *
-                         F.normalize(self.all_parts, dim=-1)[None]).sum(-1).mean(-1) * scale
+                fixed = fixed_index_component_logits(qp, self.all_parts, scale)
                 fixed_scores.append(fixed.cpu())
                 transfer_scores.append(local_score.cpu())
                 no_transfer = query_conditioned_reconstruction(
