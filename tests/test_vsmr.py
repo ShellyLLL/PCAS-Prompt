@@ -23,6 +23,7 @@ from models.base.vsmr_resynthesis import (
 )
 from models import model_My
 from models.base.vsmr_modules import VisualSemanticDecomposer, VSMRViT
+from models.base.vsmr_trainer import ClassBalancedBatchSampler, VSMRFSCILTrainer
 
 
 class TestOptimalTransport(unittest.TestCase):
@@ -173,6 +174,38 @@ class TestPrototypeAndTransfer(unittest.TestCase):
         expected = F.normalize(expected, dim=-1).reshape(2, 3, 4, 8)
         self.assertTrue(torch.allclose(reconstructed, expected, atol=1e-5))
         self.assertTrue(torch.isfinite(scores).all())
+
+
+class TestTrainingDataPipeline(unittest.TestCase):
+    class TinyDataset(torch.utils.data.Dataset):
+        def __init__(self):
+            self.targets = [0, 0, 0, 1, 1, 1, 2, 2, 2]
+            self.transform = None
+
+        def __len__(self):
+            return len(self.targets)
+
+        def __getitem__(self, index):
+            return torch.tensor([float(index)]), self.targets[index]
+
+    def test_class_balanced_sampler_and_dataloader_contract(self):
+        dataset = self.TinyDataset()
+        sampler = ClassBalancedBatchSampler(
+            dataset.targets, classes_per_batch=3, samples_per_class=2, seed=5
+        )
+        trainer = VSMRFSCILTrainer.__new__(VSMRFSCILTrainer)
+        trainer.args = SimpleNamespace(num_workers=0)
+        trainer.device = torch.device("cpu")
+        loader = trainer._loader(dataset, batch_size=1, batch_sampler=sampler)
+        images, labels = next(iter(loader))
+        self.assertEqual(images.shape[0], 6)
+        self.assertEqual(torch.bincount(labels, minlength=3).tolist(), [2, 2, 2])
+
+    def test_exact_shot_validation_rejects_wrong_counts(self):
+        from models.base.vsmr_trainer import validate_exact_shot
+        validate_exact_shot(np.array([3, 3, 4, 4]), np.array([3, 4]), 2, 1)
+        with self.assertRaises(RuntimeError):
+            validate_exact_shot(np.array([3, 4, 4]), np.array([3, 4]), 2, 1)
 
 
 class TestAlignment(unittest.TestCase):
