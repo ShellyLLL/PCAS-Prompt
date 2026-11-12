@@ -165,14 +165,18 @@ class VSMRFSCILTrainer:
 
     def _loader(self, dataset, batch_size, batch_sampler=None):
         workers = int(getattr(self.args, "num_workers", 4))
+        common = {
+            "num_workers": workers,
+            "pin_memory": self.device.type == "cuda",
+            "persistent_workers": workers > 0,
+        }
+        wrapped = ImageLabelDataset(dataset)
+        if batch_sampler is not None:
+            # PyTorch forbids specifying batch_size, shuffle, sampler or
+            # drop_last together with batch_sampler.
+            return DataLoader(wrapped, batch_sampler=batch_sampler, **common)
         return DataLoader(
-            ImageLabelDataset(dataset),
-            batch_size=1 if batch_sampler is not None else int(batch_size),
-            shuffle=False,
-            batch_sampler=batch_sampler,
-            num_workers=workers,
-            pin_memory=self.device.type == "cuda",
-            persistent_workers=workers > 0,
+            wrapped, batch_size=int(batch_size), shuffle=False, **common
         )
 
     @torch.no_grad()
