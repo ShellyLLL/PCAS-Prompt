@@ -532,7 +532,7 @@ class VSMRFSCILTrainer:
             ))
         new_global = torch.stack(new_global)
         raw_new_parts = torch.stack(new_parts)
-        composed, alpha, reliability, selected = compose_novel_prototypes(
+        composed, alpha, reliability, selected, transfer_weights = compose_novel_prototypes(
             raw_new_parts, self.base_bank,
             top_r=int(getattr(self.args, "vsmr_transfer_top_r", 5)),
             alpha_max=float(getattr(self.args, "vsmr_transfer_alpha_max", 0.5)),
@@ -555,6 +555,7 @@ class VSMRFSCILTrainer:
             "transfer_selected_base_components": int(selected.numel()),
             "transfer_unique_base_components": int(torch.unique(selected).numel()),
             "transfer_selected_component_ids": selected.cpu().tolist(),
+            "transfer_selected_weights": transfer_weights.cpu().tolist(),
             "transfer_selected_base_class_ids": self.base_owner[selected].cpu().tolist(),
             "transfer_alpha_per_class": alpha.mean(dim=1).cpu().tolist(),
             "transfer_reliability_per_class": reliability.mean(dim=1).cpu().tolist(),
