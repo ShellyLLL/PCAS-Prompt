@@ -74,12 +74,15 @@ class FrozenViTBackbone(nn.Module):
 class VisualSemanticDecomposer(nn.Module):
     """Shared soft prompts that pool Patch features into unordered parts."""
 
-    def __init__(self, embed_dim=768, num_parts=6):
+    def __init__(self, embed_dim=768, num_parts=6, temperature=1.0):
         super().__init__()
         if int(embed_dim) <= 0 or int(num_parts) < 2:
             raise ValueError("embed_dim must be positive and num_parts >= 2.")
+        if float(temperature) <= 0:
+            raise ValueError("Prompt attention temperature must be positive.")
         self.embed_dim = int(embed_dim)
         self.num_parts = int(num_parts)
+        self.temperature = float(temperature)
 
         self.shared_prompts = nn.Parameter(
             torch.empty(self.num_parts, self.embed_dim)
@@ -114,7 +117,7 @@ class VisualSemanticDecomposer(nn.Module):
 
         attention_logits = torch.einsum(
             "kd,bnd->bkn", queries, keys
-        ) / math.sqrt(self.embed_dim)
+        ) / (math.sqrt(self.embed_dim) * self.temperature)
         attention = torch.softmax(attention_logits, dim=-1)
 
         local_parts = torch.bmm(attention, values)
@@ -139,6 +142,7 @@ class VSMRViT(nn.Module):
         self.decomposer = VisualSemanticDecomposer(
             embed_dim=self.backbone.embed_dim,
             num_parts=int(getattr(args, "vsmr_num_parts", 6)),
+            temperature=float(getattr(args, "vsmr_prompt_temperature", 1.0)),
         )
         self._incremental_frozen = False
 
