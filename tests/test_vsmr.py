@@ -39,9 +39,10 @@ class TestOptimalTransport(unittest.TestCase):
     def test_ot_is_permutation_invariant(self):
         a = F.normalize(torch.randn(2, 6, 16), dim=-1)
         b = F.normalize(torch.randn(2, 6, 16), dim=-1)
-        permutation = torch.tensor([3, 0, 5, 2, 1, 4])
+        permutation_a = torch.tensor([3, 0, 5, 2, 1, 4])
+        permutation_b = torch.tensor([2, 5, 1, 4, 0, 3])
         distance = ot_distance(a, b)
-        permuted = ot_distance(a[:, permutation], b[:, permutation])
+        permuted = ot_distance(a[:, permutation_a], b[:, permutation_b])
         self.assertTrue(torch.allclose(distance, permuted, atol=2e-4))
 
     def test_barycenter_handles_singleton_and_multiple_sets(self):
