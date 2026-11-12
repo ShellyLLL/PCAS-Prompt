@@ -318,6 +318,8 @@ class VSMRFSCILTrainer:
             "base_global": self.base_global.cpu(),
             "base_parts": self.base_parts.cpu(),
             "base_component_bank": self.base_bank.cpu(),
+            "base_component_owner": self.base_owner.cpu(),
+            "base_component_part_ids": self.base_part_ids.cpu(),
             "method": "VSMR",
         }, os.path.join(self.save_dir, "vsmr_base.pth"))
 
@@ -437,6 +439,27 @@ class VSMRFSCILTrainer:
         }
         return metrics
 
+    def _audit_support_test_paths(self, support_set, testset, session):
+        if not hasattr(support_set, "data") or not hasattr(testset, "data"):
+            return
+        support_paths = [
+            os.path.realpath(os.path.expanduser(str(path)))
+            for path in support_set.data
+        ]
+        test_paths = [
+            os.path.realpath(os.path.expanduser(str(path)))
+            for path in testset.data
+        ]
+        if len(set(support_paths)) != len(support_paths):
+            raise RuntimeError("Session {} has duplicate support image paths.".format(session))
+        overlap = set(support_paths).intersection(test_paths)
+        if overlap:
+            raise RuntimeError(
+                "Session {} support/test leakage: {} shared image paths.".format(
+                    session, len(overlap)
+                )
+            )
+
     @torch.no_grad()
     def _incremental(self, support_set, testset, session):
         base_class, way = int(self.args.base_class), int(self.args.way)
@@ -444,6 +467,7 @@ class VSMRFSCILTrainer:
                              base_class + session * way)
         support_labels = np.asarray(support_set.targets, dtype=np.int64)
         validate_exact_shot(support_labels, expected, int(self.args.shot), session)
+        self._audit_support_test_paths(support_set, testset, session)
         old_global, old_parts = self.all_global.clone(), self.all_parts.clone()
         global_features, parts, labels = self._extract(support_set)
         new_global, new_parts = [], []
@@ -516,6 +540,9 @@ class VSMRFSCILTrainer:
             "model": self.model.state_dict(),
             "base_global": self.base_global.cpu(),
             "base_parts": self.base_parts.cpu(),
+            "base_component_bank": self.base_bank.cpu(),
+            "base_component_owner": self.base_owner.cpu(),
+            "base_component_part_ids": self.base_part_ids.cpu(),
             "all_global": self.all_global.cpu(),
             "all_parts": self.all_parts.cpu(),
             "all_raw_parts": self.all_raw_parts.cpu(),
