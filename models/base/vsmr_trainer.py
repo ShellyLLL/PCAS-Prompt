@@ -128,10 +128,13 @@ class VSMRFSCILTrainer:
         root = root if os.path.isabs(root) else os.path.join(repo_root, "checkpoint", root)
         self.save_dir = os.path.join(
             root, self.args.dataset, "VSMR",
-            time.strftime("%Y%m%d_%H%M%S")
+            "{}_seed{}".format(time.strftime("%Y%m%d_%H%M%S"), self.seed)
         )
         os.makedirs(self.save_dir, exist_ok=True)
         self.log_path = os.path.join(self.save_dir, "metrics.jsonl")
+        with open(os.path.join(self.save_dir, "config.json"), "w") as handle:
+            json.dump(vars(self.args), handle, ensure_ascii=False, indent=2, default=str)
+        print("[VSMR] Output directory: {}".format(self.save_dir))
         self.results = []
         self.base_parts = None
         self.base_global = None
