@@ -371,6 +371,7 @@ class VSMRFSCILTrainer:
         if wg < 0 or wl < 0 or wg + wl <= 0:
             raise ValueError("Global/local classification weights are invalid.")
         pred, target = [], []
+        raw_joint_predictions, fixed_joint_predictions = [], []
         transfer_scores, no_transfer_scores, fixed_scores, ot_entropies = [], [], [], []
         self.model.eval()
         try:
@@ -392,27 +393,36 @@ class VSMRFSCILTrainer:
                 pred.append(logits.argmax(1).cpu())
                 target.append(labels.cpu())
 
-                # Query reconstruction ablation: fixed index pairing is not
-                # allowed in the main path; report it only as a diagnostic.
+                # Controlled ablations use the same query, global branch and
+                # classifier weights; only transfer or matching is removed.
                 fixed = (F.normalize(qp, dim=-1) *
-                         F.normalize(self.all_parts, dim=-1)[None]).sum(-1).mean(-1)
+                         F.normalize(self.all_parts, dim=-1)[None]).sum(-1).mean(-1) * scale
                 fixed_scores.append(fixed.cpu())
                 transfer_scores.append(local_score.cpu())
                 no_transfer = query_conditioned_reconstruction(
                     qp, self.all_raw_parts, eps, steps
                 )[0] * scale
                 no_transfer_scores.append(no_transfer.cpu())
+                raw_joint = (wg * gl + wl * no_transfer) / (wg + wl)
+                fixed_joint = (wg * gl + wl * fixed) / (wg + wl)
+                raw_joint_predictions.append(raw_joint.argmax(1).cpu())
+                fixed_joint_predictions.append(fixed_joint.argmax(1).cpu())
         finally:
             testset.transform = original
         predictions, labels = torch.cat(pred), torch.cat(target)
         transferred_local = torch.cat(transfer_scores)
         raw_local = torch.cat(no_transfer_scores)
         fixed_local = torch.cat(fixed_scores)
+        raw_joint_pred = torch.cat(raw_joint_predictions)
+        fixed_joint_pred = torch.cat(fixed_joint_predictions)
         counts = torch.bincount(labels, minlength=int(seen_classes))
         if labels.numel() == 0 or torch.any(counts[:int(seen_classes)] == 0):
             raise RuntimeError("Session {} evaluation misses seen classes.".format(session))
         accuracy = float((predictions == labels).float().mean())
         macro = class_average_accuracy(labels, predictions, seen_classes)
+        raw_joint_accuracy = float((raw_joint_pred == labels).float().mean())
+        raw_joint_macro = class_average_accuracy(labels, raw_joint_pred, seen_classes)
+        fixed_joint_accuracy = float((fixed_joint_pred == labels).float().mean())
         base_mask = labels < int(self.args.base_class)
         novel_mask = ~base_mask
         base_acc = float((predictions[base_mask] == labels[base_mask]).float().mean()) if base_mask.any() else None
@@ -423,6 +433,11 @@ class VSMRFSCILTrainer:
             "base_accuracy": base_acc, "novel_accuracy": novel_acc,
             "novel_to_base_error": float((predictions[novel_mask] < int(self.args.base_class)).float().mean()) if novel_mask.any() else None,
             "evaluation_samples": int(labels.numel()),
+            "joint_accuracy_before_transfer": raw_joint_accuracy,
+            "class_average_accuracy_before_transfer": raw_joint_macro,
+            "joint_transfer_gain": accuracy - raw_joint_accuracy,
+            "joint_accuracy_fixed_index": fixed_joint_accuracy,
+            "query_ot_joint_gain_over_fixed_index": accuracy - fixed_joint_accuracy,
             "local_accuracy_after_transfer": float((transferred_local.argmax(1) == labels).float().mean()),
             "local_accuracy_before_transfer": float((raw_local.argmax(1) == labels).float().mean()),
             "local_transfer_gain": float(
