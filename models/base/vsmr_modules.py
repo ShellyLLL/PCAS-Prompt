@@ -36,10 +36,21 @@ class FrozenViTBackbone(nn.Module):
                     getattr(self.encoder, "embed_dim", 768))
         )
         if encoder is None:
-            if self.embed_dim != 768 or len(self.encoder.blocks) != 12:
+            patch_size = getattr(
+                getattr(self.encoder, "patch_embed", None), "patch_size", None
+            )
+            if isinstance(patch_size, int):
+                patch_size = (patch_size, patch_size)
+            elif patch_size is not None:
+                patch_size = tuple(patch_size)
+            if (
+                self.embed_dim != 768
+                or len(self.encoder.blocks) != 12
+                or patch_size != (16, 16)
+            ):
                 raise RuntimeError(
                     "VSMR requires the repository's pretrained ViT-B/16 "
-                    "(768 dimensions and 12 Transformer blocks)."
+                    "(patch 16, 768 dimensions and 12 Transformer blocks)."
                 )
 
         for parameter in self.encoder.parameters():
@@ -50,7 +61,7 @@ class FrozenViTBackbone(nn.Module):
         # Read it from the instantiated model so preprocessing follows the
         # actual ViT-B/16 weights rather than the downstream dataset defaults.
         pretrained_cfg = getattr(self.encoder, "pretrained_cfg", None)
-        if not isinstance(pretrained_cfg, dict):
+        if not isinstance(pretrained_cfg, dict) or "mean" not in pretrained_cfg:
             pretrained_cfg = getattr(self.encoder, "default_cfg", {})
         if not isinstance(pretrained_cfg, dict):
             pretrained_cfg = {}
