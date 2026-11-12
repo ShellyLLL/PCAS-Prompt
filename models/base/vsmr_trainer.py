@@ -416,7 +416,7 @@ class VSMRFSCILTrainer:
             "stage": "evaluation", "session": int(session),
             "sample_accuracy": accuracy, "class_average_accuracy": macro,
             "base_accuracy": base_acc, "novel_accuracy": novel_acc,
-            "novel_to_base_error": float((predictions[novel_mask] < int(self.args.base_class)).float().mean()) if novel_mask.any() else float("nan"),
+            "novel_to_base_error": float((predictions[novel_mask] < int(self.args.base_class)).float().mean()) if novel_mask.any() else None,
             "evaluation_samples": int(labels.numel()),
             "local_accuracy_after_transfer": float((transferred_local.argmax(1) == labels).float().mean()),
             "local_accuracy_before_transfer": float((raw_local.argmax(1) == labels).float().mean()),
