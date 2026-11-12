@@ -263,7 +263,8 @@ class VSMRFSCILTrainer:
                     (features * loo_global).sum(-1, keepdim=True) * scale
                 )
                 l_logits, local_classes = local_leave_one_out_logits(
-                    parts, labels_batch, eps, sinkhorn_steps, scale
+                    parts, labels_batch, eps, sinkhorn_steps, scale,
+                    int(getattr(self.args, "vsmr_barycenter_iterations", 5))
                 )
                 if not torch.equal(classes, local_classes):
                     raise RuntimeError("Global/local class order mismatch.")
