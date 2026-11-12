@@ -121,8 +121,15 @@ class TestPrototypeAndTransfer(unittest.TestCase):
         self.assertEqual(scores.shape, (2, 3))
         self.assertEqual(reconstructed.shape, (2, 3, 4, 8))
         self.assertEqual(transport.shape, (2, 3, 4, 4))
-        # Reconstructed values are convex combinations of stored prototypes.
-        self.assertTrue(torch.isfinite(reconstructed).all())
+        # Reconstructed values equal normalized query-conditioned weighted
+        # sums of stored class prototype parts; query values are not injected.
+        flat_proto = F.normalize(prototypes, dim=-1)[None].expand(2, -1, -1, -1)
+        expected = torch.matmul(
+            transport.reshape(-1, 4, 4) * 4.0,
+            flat_proto.reshape(-1, 4, 8),
+        )
+        expected = F.normalize(expected, dim=-1).reshape(2, 3, 4, 8)
+        self.assertTrue(torch.allclose(reconstructed, expected, atol=1e-5))
         self.assertTrue(torch.isfinite(scores).all())
 
 
