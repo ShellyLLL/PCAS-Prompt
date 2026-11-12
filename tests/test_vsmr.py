@@ -104,13 +104,15 @@ class TestPrototypeAndTransfer(unittest.TestCase):
         base = F.normalize(torch.randn(3, 4, 8), dim=-1)
         bank, owner, part_id = build_base_component_bank(base)
         novel = F.normalize(torch.randn(2, 4, 8), dim=-1)
-        composed, alpha, reliability, indices = compose_novel_prototypes(
+        composed, alpha, reliability, indices, weights = compose_novel_prototypes(
             novel, bank, top_r=3
         )
         self.assertEqual(composed.shape, novel.shape)
         self.assertEqual(alpha.shape, novel.shape[:2])
         self.assertTrue(torch.all(alpha <= 0.5 + 1e-6))
         self.assertEqual(indices.shape, (2, 4, 3))
+        self.assertEqual(weights.shape, (2, 4, 3))
+        self.assertTrue(torch.allclose(weights.sum(-1), torch.ones(2, 4), atol=1e-6))
         self.assertEqual(owner.shape, (12,))
         self.assertEqual(part_id.shape, (12,))
         self.assertTrue(torch.isfinite(reliability).all())
