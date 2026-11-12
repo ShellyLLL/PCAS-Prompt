@@ -99,39 +99,54 @@ def leave_one_out_global(features, labels):
 
 def local_leave_one_out_logits(parts, labels, epsilon=0.05, iterations=30,
                                temperature=0.1):
-    """Local class logits from OT distances to distinct same-class samples."""
+    """OT logits against class barycenters, excluding each query from its class.
+
+    For each query, the target-class prototype is an OT barycenter of the
+    other samples in that class. Other-class prototypes use all batch samples
+    of the corresponding class. This exactly matches the inference distance
+    family and prevents self-match leakage.
+    """
     if parts.ndim != 3 or labels.ndim != 1 or parts.shape[0] != labels.numel():
         raise ValueError("Expected parts [B,K,D] and labels [B].")
     if float(temperature) <= 0:
         raise ValueError("Local distance temperature must be positive.")
-    distances = pairwise_ot_distances(parts, epsilon, iterations)
     labels = labels.long()
     classes = torch.unique(labels, sorted=True)
-    columns = []
-    for cls in classes:
-        same = labels == cls
-        # Smooth nearest-neighbor distance; diagonal is excluded for LOO.
-        class_dist = distances[:, same].clone()
-        class_indices = torch.nonzero(same, as_tuple=False).flatten()
-        diagonal_positions = torch.full(
-            (labels.numel(),), -1, device=labels.device, dtype=torch.long
+    class_indices = {
+        int(cls): torch.nonzero(labels == cls, as_tuple=False).flatten()
+        for cls in classes
+    }
+    if any(indices.numel() < 2 for indices in class_indices.values()):
+        raise ValueError("Each class requires at least two samples for local LOO.")
+    full_prototypes = {
+        int(cls): ot_barycenter(
+            parts[indices], epsilon, iterations, outer_iterations=3
         )
-        diagonal_positions[class_indices] = torch.arange(
-            class_indices.numel(), device=labels.device
-        )
-        rows = torch.arange(labels.numel(), device=labels.device)
-        own = labels == cls
-        class_dist[rows[own], diagonal_positions[own]] = float("inf")
-        valid = torch.isfinite(class_dist)
-        safe = class_dist.masked_fill(~valid, 1e6)
-        count = valid.sum(dim=1).clamp_min(1)
-        soft_min = -float(temperature) * (
-            torch.logsumexp(-safe / float(temperature), dim=1)
-            - count.to(parts.dtype).log()
-        )
-        columns.append(-soft_min)
-    return torch.stack(columns, dim=1), classes
-
+        for cls, indices in class_indices.items()
+    }
+    rows = []
+    for sample_index in range(parts.shape[0]):
+        row_scores = []
+        own_class = int(labels[sample_index])
+        for cls in classes:
+            cls_id = int(cls)
+            indices = class_indices[cls_id]
+            if cls_id == own_class:
+                retained = indices[indices != sample_index]
+                prototype = ot_barycenter(
+                    parts[retained], epsilon, iterations, outer_iterations=3
+                )
+            else:
+                prototype = full_prototypes[cls_id]
+            distance = ot_distance(
+                parts[sample_index:sample_index + 1],
+                prototype.unsqueeze(0),
+                epsilon,
+                iterations,
+            )[0]
+            row_scores.append(-distance)
+        rows.append(torch.stack(row_scores))
+    return torch.stack(rows, dim=0), classes
 
 def js_divergence(p_logits, q_logits):
     """Symmetric Jensen-Shannon divergence between two categorical logits."""
