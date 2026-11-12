@@ -98,18 +98,16 @@ def leave_one_out_global(features, labels):
 
 
 def local_leave_one_out_logits(parts, labels, epsilon=0.05, iterations=30,
-                               temperature=0.1):
-    """OT logits against class barycenters, excluding each query from its class.
+                               logit_scale=16.0):
+    """Query-conditioned local logits against OT class barycenters.
 
-    For each query, the target-class prototype is an OT barycenter of the
-    other samples in that class. Other-class prototypes use all batch samples
-    of the corresponding class. This exactly matches the inference distance
-    family and prevents self-match leakage.
+    The target-class barycenter excludes the query. Other class barycenters
+    use all batch samples of that class. Query-conditioned OT assignments
+    reconstruct values only from the candidate class prototype set, exactly
+    as in incremental inference.
     """
     if parts.ndim != 3 or labels.ndim != 1 or parts.shape[0] != labels.numel():
         raise ValueError("Expected parts [B,K,D] and labels [B].")
-    if float(temperature) <= 0:
-        raise ValueError("Local distance temperature must be positive.")
     labels = labels.long()
     classes = torch.unique(labels, sorted=True)
     class_indices = {
@@ -125,9 +123,11 @@ def local_leave_one_out_logits(parts, labels, epsilon=0.05, iterations=30,
         for cls, indices in class_indices.items()
     }
     rows = []
+    k = parts.shape[1]
     for sample_index in range(parts.shape[0]):
         row_scores = []
         own_class = int(labels[sample_index])
+        query = F.normalize(parts[sample_index:sample_index + 1], dim=-1)
         for cls in classes:
             cls_id = int(cls)
             indices = class_indices[cls_id]
@@ -138,13 +138,13 @@ def local_leave_one_out_logits(parts, labels, epsilon=0.05, iterations=30,
                 )
             else:
                 prototype = full_prototypes[cls_id]
-            distance = ot_distance(
-                parts[sample_index:sample_index + 1],
-                prototype.unsqueeze(0),
-                epsilon,
-                iterations,
-            )[0]
-            row_scores.append(-distance)
+            prototype = F.normalize(prototype.unsqueeze(0), dim=-1)
+            cost = pairwise_component_cost(query, prototype)
+            transport = sinkhorn_transport(cost, epsilon, iterations)
+            reconstructed = torch.matmul(transport * float(k), prototype)
+            reconstructed = F.normalize(reconstructed, dim=-1)
+            similarity = F.cosine_similarity(query, reconstructed, dim=-1).mean()
+            row_scores.append(similarity * float(logit_scale))
         rows.append(torch.stack(row_scores))
     return torch.stack(rows, dim=0), classes
 
