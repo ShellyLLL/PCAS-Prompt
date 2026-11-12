@@ -30,7 +30,6 @@ def get_command_line_parser():
     parser.add_argument('--vsmr_ot_epsilon', type=float, default=0.05)
     parser.add_argument('--vsmr_sinkhorn_iterations', type=int, default=30)
     parser.add_argument('--vsmr_barycenter_iterations', type=int, default=5)
-    parser.add_argument('--vsmr_local_temperature', type=float, default=0.1)
     parser.add_argument('--vsmr_local_weight', type=float, default=1.0)
     parser.add_argument('--vsmr_alignment_weight', type=float, default=0.2)
     parser.add_argument('--vsmr_cisa_weight', type=float, default=0.1)
