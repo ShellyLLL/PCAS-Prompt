@@ -18,11 +18,13 @@ from .vsmr_modules import VSMRViT
 from .vsmr_losses import (
     attention_overlap_loss, cross_image_semantic_alignment,
     fixed_index_component_logits, global_logits, leave_one_out_global,
-    local_leave_one_out_logits,
-    local_logits, ot_barycenter,
+    ot_barycenter,
 )
 from .vsmr_resynthesis import (
-    build_base_component_bank, compose_novel_prototypes,
+    build_base_component_bank,
+    component_support_variance,
+    compose_novel_prototypes,
+    local_leave_one_out_query_logits,
     query_conditioned_reconstruction,
 )
 
@@ -209,6 +211,134 @@ class VSMRFSCILTrainer:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         print("[VSMR] " + json.dumps(record, ensure_ascii=False, sort_keys=True))
 
+
+    def _pseudo_incremental_episode(self, features, parts, patches, labels,
+                                    epsilon, sinkhorn_steps, logit_scale):
+        """Train transfer and reconstruction as a genuine base-to-novel episode.
+
+        A subset of batch classes is hidden from the episode's base memory.
+        Their K-shot support prototypes are composed only from the remaining
+        pseudo-base classes; held-out query images are classified against both
+        pseudo-base and pseudo-novel prototypes. No pseudo-novel class can
+        retrieve its own class components.
+        """
+        classes = torch.unique(labels.long(), sorted=True)
+        if classes.numel() < 2:
+            zero = features.sum() * 0.0
+            return zero, zero, zero
+
+        fraction = float(getattr(self.args, "vsmr_episode_novel_fraction", 0.25))
+        if not 0.0 < fraction < 1.0:
+            raise ValueError("vsmr_episode_novel_fraction must be in (0,1).")
+        novel_count = max(1, min(
+            int(classes.numel()) - 1,
+            int(round(int(classes.numel()) * fraction)),
+        ))
+        order = torch.randperm(classes.numel(), device=classes.device)
+        novel_classes = classes[order[:novel_count]]
+        base_classes = classes[order[novel_count:]]
+
+        base_global = []
+        base_parts = []
+        for cls in base_classes:
+            indices = torch.nonzero(labels == cls, as_tuple=False).flatten()
+            base_global.append(F.normalize(features[indices].mean(0), dim=-1))
+            base_parts.append(ot_barycenter(
+                parts[indices], epsilon, sinkhorn_steps,
+                int(getattr(self.args, "vsmr_barycenter_iterations", 5)),
+            ))
+        base_global = torch.stack(base_global)
+        base_parts = torch.stack(base_parts)
+        base_bank, base_owner, _ = build_base_component_bank(base_parts)
+
+        novel_global = []
+        novel_raw_parts = []
+        novel_variance = []
+        shots = []
+        query_indices = []
+        query_targets = []
+        max_shot = int(getattr(self.args, "vsmr_episode_max_shot", 3))
+
+        for novel_position, cls in enumerate(novel_classes):
+            indices = torch.nonzero(labels == cls, as_tuple=False).flatten()
+            if indices.numel() < 2:
+                raise RuntimeError("Pseudo-novel classes need support and query images.")
+            shot_limit = min(max_shot, int(indices.numel()) - 1)
+            if shot_limit < 1:
+                raise RuntimeError("vsmr_episode_max_shot must leave a query image.")
+            shuffled = indices[torch.randperm(indices.numel(), device=indices.device)]
+            shot = int(torch.randint(
+                1, shot_limit + 1, (1,), device=indices.device
+            ).item())
+            support_indices = shuffled[:shot]
+            query_for_class = shuffled[shot:]
+
+            support_local = parts[support_indices]
+            local_prototype = ot_barycenter(
+                support_local, epsilon, sinkhorn_steps,
+                int(getattr(self.args, "vsmr_barycenter_iterations", 5)),
+            )
+            novel_global.append(F.normalize(
+                features[support_indices].mean(0), dim=-1
+            ))
+            novel_raw_parts.append(local_prototype)
+            novel_variance.append(component_support_variance(
+                support_local, local_prototype, epsilon, sinkhorn_steps
+            ))
+            shots.append(shot)
+            query_indices.append(query_for_class)
+            query_targets.append(torch.full(
+                (query_for_class.numel(),),
+                int(base_classes.numel()) + novel_position,
+                dtype=torch.long,
+                device=labels.device,
+            ))
+
+        novel_global = torch.stack(novel_global)
+        novel_raw_parts = torch.stack(novel_raw_parts)
+        novel_variance = torch.stack(novel_variance)
+        shot_tensor = torch.tensor(shots, dtype=features.dtype, device=features.device)
+        novel_parts, _, _, _, _ = compose_novel_prototypes(
+            novel_raw_parts,
+            base_bank,
+            self.model.reliability_gate,
+            base_owner=base_owner,
+            top_r=int(getattr(self.args, "vsmr_transfer_top_r", 5)),
+            alpha_max=float(getattr(self.args, "vsmr_transfer_alpha_max", 0.5)),
+            similarity_temperature=float(getattr(self.args, "vsmr_transfer_temperature", 0.1)),
+            support_variance=novel_variance,
+            shots=shot_tensor,
+        )
+
+        candidate_global = torch.cat([base_global, novel_global], dim=0)
+        candidate_parts = torch.cat([base_parts, novel_parts], dim=0)
+        query_indices = torch.cat(query_indices, dim=0)
+        query_targets = torch.cat(query_targets, dim=0)
+        if query_indices.numel() == 0:
+            raise RuntimeError("Pseudo-incremental episode produced no query images.")
+
+        query_global = features[query_indices]
+        query_parts = parts[query_indices]
+        query_patches = patches[query_indices]
+        global_scores = global_logits(
+            query_global, candidate_global, logit_scale
+        )
+        local_scores, _, _, _ = query_conditioned_reconstruction(
+            query_parts,
+            query_patches,
+            candidate_parts,
+            self.model.reconstructor,
+            epsilon=epsilon,
+            iterations=sinkhorn_steps,
+            scale=logit_scale,
+        )
+        joint_scores = self.model.fusion(global_scores, local_scores)
+        return (
+            F.cross_entropy(global_scores, query_targets),
+            F.cross_entropy(local_scores, query_targets),
+            F.cross_entropy(joint_scores, query_targets),
+        )
+
     def _train_base(self, trainset):
         labels = np.asarray(trainset.targets, dtype=np.int64)
         if not np.array_equal(np.unique(labels), np.arange(int(self.args.base_class))):
@@ -222,8 +352,14 @@ class VSMRFSCILTrainer:
             int(getattr(self.args, "vsmr_samples_per_class", 4)), self.seed
         )
         loader = self._loader(trainset, 1, batch_sampler=sampler)
+        trainable_parameters = [
+            parameter for parameter in self.model.parameters()
+            if parameter.requires_grad
+        ]
+        if not trainable_parameters:
+            raise RuntimeError("VSMR has no trainable base-stage parameters.")
         optimizer = torch.optim.AdamW(
-            self.model.decomposer.parameters(),
+            trainable_parameters,
             lr=float(getattr(self.args, "vsmr_lr", 2e-4)),
             weight_decay=float(getattr(self.args, "vsmr_weight_decay", 1e-4)),
         )
@@ -234,6 +370,7 @@ class VSMRFSCILTrainer:
         eps = float(getattr(self.args, "vsmr_ot_epsilon", 0.05))
         sinkhorn_steps = int(getattr(self.args, "vsmr_sinkhorn_iterations", 30))
         w_local = float(getattr(self.args, "vsmr_local_weight", 1.0))
+        w_joint = float(getattr(self.args, "vsmr_joint_weight", 1.0))
         w_align = float(getattr(self.args, "vsmr_alignment_weight", 0.2))
         w_cisa = float(getattr(self.args, "vsmr_cisa_weight", 0.1))
         w_overlap = float(getattr(self.args, "vsmr_overlap_weight", 0.01))
@@ -243,7 +380,8 @@ class VSMRFSCILTrainer:
             sampler.set_epoch(epoch)
             self.model.train()
             totals = {k: 0.0 for k in (
-                "total", "global", "local", "alignment", "cisa", "overlap",
+                "total", "global", "local", "joint", "alignment", "cisa", "overlap",
+                "episode_global", "episode_local", "episode_joint",
                 "global_acc", "local_acc", "joint_acc", "ot_same"
             )}
             steps = 0
@@ -253,8 +391,9 @@ class VSMRFSCILTrainer:
                 images = images.to(self.device, non_blocking=True)
                 labels_batch = torch.as_tensor(batch_labels, device=self.device).long()
                 output = self.model(images)
-                features, parts, attention = (
-                    output["global_features"], output["parts"], output["attention"]
+                features, parts, attention, patch_features = (
+                    output["global_features"], output["parts"],
+                    output["attention"], output["patch_features"]
                 )
                 loo_global, inverse, classes = leave_one_out_global(features, labels_batch)
                 # Other-class prototypes are batch means; own-class column is
@@ -270,9 +409,15 @@ class VSMRFSCILTrainer:
                     1, inverse[:, None],
                     (features * loo_global).sum(-1, keepdim=True) * scale
                 )
-                l_logits, local_classes = local_leave_one_out_logits(
-                    parts, labels_batch, eps, sinkhorn_steps, scale,
-                    int(getattr(self.args, "vsmr_barycenter_iterations", 5))
+                l_logits, local_classes = local_leave_one_out_query_logits(
+                    parts,
+                    patch_features,
+                    labels_batch,
+                    self.model.reconstructor,
+                    eps,
+                    sinkhorn_steps,
+                    scale,
+                    int(getattr(self.args, "vsmr_barycenter_iterations", 5)),
                 )
                 if not torch.equal(classes, local_classes):
                     raise RuntimeError("Global/local class order mismatch.")
@@ -282,14 +427,26 @@ class VSMRFSCILTrainer:
                 same = labels_batch[:, None].eq(labels_batch[None, :])
                 same.fill_diagonal_(False)
                 align_loss = pair_dist[same].mean()
-                global_loss = F.cross_entropy(g_logits, inverse)
-                local_loss = F.cross_entropy(l_logits, inverse)
+                base_global_loss = F.cross_entropy(g_logits, inverse)
+                base_local_loss = F.cross_entropy(l_logits, inverse)
+                base_joint_logits = self.model.fusion(g_logits, l_logits)
+                base_joint_loss = F.cross_entropy(base_joint_logits, inverse)
+
+                episode_global_loss, episode_local_loss, episode_joint_loss = (
+                    self._pseudo_incremental_episode(
+                        features, parts, patch_features, labels_batch,
+                        eps, sinkhorn_steps, scale,
+                    )
+                )
+                global_loss = 0.5 * (base_global_loss + episode_global_loss)
+                local_loss = 0.5 * (base_local_loss + episode_local_loss)
+                joint_loss = 0.5 * (base_joint_loss + episode_joint_loss)
                 cisa_loss = cross_image_semantic_alignment(
                     g_logits, l_logits, labels_batch
                 )
                 overlap_loss = attention_overlap_loss(attention)
                 total = (
-                    global_loss + w_local * local_loss
+                    global_loss + w_local * local_loss + w_joint * joint_loss
                     + w_align * align_loss + w_cisa * cisa_loss
                     + w_overlap * overlap_loss
                 )
@@ -297,26 +454,32 @@ class VSMRFSCILTrainer:
                     raise FloatingPointError("Non-finite VSMR loss.")
                 optimizer.zero_grad(set_to_none=True)
                 total.backward()
-                for name, parameter in self.model.decomposer.named_parameters():
-                    if parameter.grad is not None and not torch.isfinite(parameter.grad).all():
-                        raise FloatingPointError("Non-finite gradient: " + name)
+                for name, parameter in self.model.named_parameters():
+                    if parameter.requires_grad and parameter.grad is not None:
+                        if not torch.isfinite(parameter.grad).all():
+                            raise FloatingPointError("Non-finite gradient: " + name)
                 optimizer.step()
 
                 with torch.no_grad():
                     totals["total"] += float(total)
                     totals["global"] += float(global_loss)
                     totals["local"] += float(local_loss)
+                    totals["joint"] += float(joint_loss)
+                    totals["episode_global"] += float(episode_global_loss)
+                    totals["episode_local"] += float(episode_local_loss)
+                    totals["episode_joint"] += float(episode_joint_loss)
                     totals["alignment"] += float(align_loss)
                     totals["cisa"] += float(cisa_loss)
                     totals["overlap"] += float(overlap_loss)
                     totals["global_acc"] += float((g_logits.argmax(1) == inverse).float().mean())
                     totals["local_acc"] += float((l_logits.argmax(1) == inverse).float().mean())
-                    totals["joint_acc"] += float(((g_logits + w_local * l_logits).argmax(1) == inverse).float().mean())
+                    totals["joint_acc"] += float((base_joint_logits.argmax(1) == inverse).float().mean())
                     totals["ot_same"] += float(pair_dist[same].mean())
                 steps += 1
             scheduler.step()
             record = {"stage": "base_train", "epoch": epoch + 1}
             record.update({k: v / max(steps, 1) for k, v in totals.items()})
+            record["fusion_alpha"] = float(self.model.fusion.alpha.detach().item())
             record["lr"] = scheduler.get_last_lr()[0]
             self._append_log(record)
 
@@ -375,10 +538,6 @@ class VSMRFSCILTrainer:
         eps = float(getattr(self.args, "vsmr_ot_epsilon", 0.05))
         steps = int(getattr(self.args, "vsmr_sinkhorn_iterations", 30))
         scale = float(getattr(self.args, "vsmr_logit_scale", 16.0))
-        wg = float(getattr(self.args, "vsmr_global_weight", 0.5))
-        wl = float(getattr(self.args, "vsmr_local_weight_eval", 0.5))
-        if wg < 0 or wl < 0 or wg + wl <= 0:
-            raise ValueError("Global/local classification weights are invalid.")
         pred, target = [], []
         raw_joint_predictions, fixed_joint_predictions = [], []
         transfer_scores, no_transfer_scores, fixed_scores, ot_entropies = [], [], [], []
@@ -388,17 +547,25 @@ class VSMRFSCILTrainer:
                 images = images.to(self.device, non_blocking=True)
                 labels = torch.as_tensor(labels, device=self.device).long()
                 output = self.model(images)
-                gf, qp = output["global_features"], output["parts"]
-                gl = global_logits(gf, self.all_global, scale)
-                local_score, _, transport = query_conditioned_reconstruction(
-                    qp, self.all_parts, eps, steps
+                gf, qp, query_patches = (
+                    output["global_features"], output["parts"],
+                    output["patch_features"]
                 )
-                local_score = local_score * scale
+                gl = global_logits(gf, self.all_global, scale)
+                local_score, _, transport, _ = query_conditioned_reconstruction(
+                    qp,
+                    query_patches,
+                    self.all_parts,
+                    self.model.reconstructor,
+                    eps,
+                    steps,
+                    scale,
+                )
                 transport_entropy = -(
                     transport.clamp_min(1e-8) * transport.clamp_min(1e-8).log()
                 ).sum(dim=(-1, -2)).mean(dim=-1)
                 ot_entropies.append(transport_entropy.cpu())
-                logits = (wg * gl + wl * local_score) / (wg + wl)
+                logits = self.model.fusion(gl, local_score)
                 pred.append(logits.argmax(1).cpu())
                 target.append(labels.cpu())
 
@@ -408,11 +575,17 @@ class VSMRFSCILTrainer:
                 fixed_scores.append(fixed.cpu())
                 transfer_scores.append(local_score.cpu())
                 no_transfer = query_conditioned_reconstruction(
-                    qp, self.all_raw_parts, eps, steps
-                )[0] * scale
+                    qp,
+                    query_patches,
+                    self.all_raw_parts,
+                    self.model.reconstructor,
+                    eps,
+                    steps,
+                    scale,
+                )[0]
                 no_transfer_scores.append(no_transfer.cpu())
-                raw_joint = (wg * gl + wl * no_transfer) / (wg + wl)
-                fixed_joint = (wg * gl + wl * fixed) / (wg + wl)
+                raw_joint = self.model.fusion(gl, no_transfer)
+                fixed_joint = self.model.fusion(gl, fixed)
                 raw_joint_predictions.append(raw_joint.argmax(1).cpu())
                 fixed_joint_predictions.append(fixed_joint.argmax(1).cpu())
         finally:
@@ -482,6 +655,7 @@ class VSMRFSCILTrainer:
                 local_after.float().mean() - local_fixed.float().mean()
             ),
             "query_ot_assignment_entropy": float(torch.cat(ot_entropies).mean()),
+            "global_local_fusion_alpha": float(self.model.fusion.alpha.detach().item()),
         }
         return metrics
 
@@ -524,6 +698,7 @@ class VSMRFSCILTrainer:
         old_global = self.all_global.clone()
         old_parts = self.all_parts.clone()
         old_raw_parts = self.all_raw_parts.clone()
+        old_base_bank = self.base_bank.clone()
         global_features, parts, labels = self._extract(support_set)
         new_global, new_parts = [], []
         for cls in expected:
@@ -539,12 +714,25 @@ class VSMRFSCILTrainer:
             ))
         new_global = torch.stack(new_global)
         raw_new_parts = torch.stack(new_parts)
+        support_variance = torch.stack([
+            component_support_variance(
+                parts[labels == int(cls)],
+                raw_new_parts[position],
+                float(getattr(self.args, "vsmr_ot_epsilon", 0.05)),
+                int(getattr(self.args, "vsmr_sinkhorn_iterations", 30)),
+            )
+            for position, cls in enumerate(expected)
+        ])
         composed, alpha, reliability, selected, transfer_weights = compose_novel_prototypes(
-            raw_new_parts, self.base_bank,
+            raw_new_parts,
+            self.base_bank,
+            self.model.reliability_gate,
+            base_owner=self.base_owner,
             top_r=int(getattr(self.args, "vsmr_transfer_top_r", 5)),
             alpha_max=float(getattr(self.args, "vsmr_transfer_alpha_max", 0.5)),
             similarity_temperature=float(getattr(self.args, "vsmr_transfer_temperature", 0.1)),
-            variance_scale=float(getattr(self.args, "vsmr_transfer_variance_scale", 0.25)),
+            support_variance=support_variance,
+            shots=int(self.args.shot),
         )
         self.all_global = torch.cat([self.all_global, new_global], dim=0)
         self.all_parts = torch.cat([self.all_parts, composed], dim=0)
@@ -555,6 +743,10 @@ class VSMRFSCILTrainer:
             raise RuntimeError("Append-only contract violated: old local memory changed.")
         if not torch.equal(self.all_raw_parts[:old_raw_parts.shape[0]], old_raw_parts):
             raise RuntimeError("Append-only contract violated: old raw local memory changed.")
+        if not torch.equal(self.base_bank, old_base_bank):
+            raise RuntimeError("Append-only contract violated: base component bank changed.")
+        if any(parameter.requires_grad for parameter in self.model.parameters()):
+            raise RuntimeError("Incremental protocol violation: model parameters are trainable.")
         metrics = self._evaluate(testset, base_class + session * way, session)
         metrics.update({
             "transfer_alpha_mean": float(alpha.mean()),
@@ -564,6 +756,7 @@ class VSMRFSCILTrainer:
             "transfer_selected_component_ids": selected.cpu().tolist(),
             "transfer_selected_weights": transfer_weights.cpu().tolist(),
             "transfer_selected_base_class_ids": self.base_owner[selected].cpu().tolist(),
+            "transfer_selected_base_part_ids": self.base_part_ids[selected].cpu().tolist(),
             "transfer_alpha_per_class": alpha.mean(dim=1).cpu().tolist(),
             "transfer_reliability_per_class": reliability.mean(dim=1).cpu().tolist(),
         })
