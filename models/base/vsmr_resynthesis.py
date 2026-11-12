@@ -101,7 +101,7 @@ def query_conditioned_reconstruction(query_parts, class_parts,
     # components. Only prototype values contribute to the reconstruction.
     assignment = transport * float(k)
     reconstructed = torch.matmul(
-        assignment.transpose(1, 2), p.reshape(-1, k, dim)
+        assignment, p.reshape(-1, k, dim)
     )
     reconstructed = F.normalize(reconstructed, dim=-1)
     # Compare each query part to its reconstructed class part via the
