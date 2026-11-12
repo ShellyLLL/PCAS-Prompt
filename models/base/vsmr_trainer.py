@@ -17,14 +17,14 @@ from dataloader.data_utils import (
 from .vsmr_modules import VSMRViT
 from .vsmr_losses import (
     attention_overlap_loss, cross_image_semantic_alignment,
-    fixed_index_component_logits, global_logits, leave_one_out_global,
-    ot_barycenter,
+    global_logits, leave_one_out_global, ot_barycenter,
 )
 from .vsmr_resynthesis import (
     build_base_component_bank,
     component_support_variance,
     compose_novel_prototypes,
     local_leave_one_out_query_logits,
+    query_conditioned_fixed_index_reconstruction,
     query_conditioned_reconstruction,
 )
 
@@ -157,13 +157,30 @@ class VSMRFSCILTrainer:
         torch.backends.cudnn.benchmark = False
 
     def _transform(self):
-        if self.args.dataset == "cifar100":
-            mean, std = [0.507, 0.487, 0.441], [0.267, 0.256, 0.276]
-        else:
-            mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        # All datasets and all FSCIL sessions must use the preprocessing
+        # associated with the exact frozen pretrained ViT checkpoint.
+        backbone = self.model.backbone
+        interpolation_names = {
+            "nearest": transforms.InterpolationMode.NEAREST,
+            "bilinear": transforms.InterpolationMode.BILINEAR,
+            "bicubic": transforms.InterpolationMode.BICUBIC,
+            "lanczos": transforms.InterpolationMode.LANCZOS,
+        }
+        interpolation = interpolation_names.get(
+            str(backbone.input_interpolation).lower()
+        )
+        if interpolation is None:
+            raise ValueError(
+                "Unsupported ViT checkpoint interpolation: {}".format(
+                    backbone.input_interpolation
+                )
+            )
+        resize_size = int(round(224.0 / float(backbone.input_crop_pct)))
         return transforms.Compose([
-            transforms.Resize(256), transforms.CenterCrop(224),
-            transforms.ToTensor(), transforms.Normalize(mean, std),
+            transforms.Resize(resize_size, interpolation=interpolation),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(backbone.input_mean, backbone.input_std),
         ])
 
     def _loader(self, dataset, batch_size, batch_sampler=None):
@@ -571,7 +588,13 @@ class VSMRFSCILTrainer:
 
                 # Controlled ablations use the same query, global branch and
                 # classifier weights; only transfer or matching is removed.
-                fixed = fixed_index_component_logits(qp, self.all_parts, scale)
+                fixed, _, _ = query_conditioned_fixed_index_reconstruction(
+                    qp,
+                    query_patches,
+                    self.all_parts,
+                    self.model.reconstructor,
+                    scale,
+                )
                 fixed_scores.append(fixed.cpu())
                 transfer_scores.append(local_score.cpu())
                 no_transfer = query_conditioned_reconstruction(
@@ -641,6 +664,7 @@ class VSMRFSCILTrainer:
             "novel_query_ot_gain_over_fixed_index": (
                 novel_query_ot - novel_fixed if novel_mask.any() else None
             ),
+            "fixed_index_uses_same_query_reconstruction": True,
             "local_accuracy_after_transfer": float(local_after.float().mean()),
             "local_accuracy_before_transfer": float(local_before.float().mean()),
             "local_transfer_gain": float(local_after.float().mean() - local_before.float().mean()),

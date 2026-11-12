@@ -121,12 +121,22 @@ class TestVisualSemanticDecomposition(unittest.TestCase):
             attn_drop_rate=0.0,
             drop_path_rate=0.0,
         )
+        encoder.default_cfg = {
+            "mean": (0.5, 0.5, 0.5),
+            "std": (0.5, 0.5, 0.5),
+            "interpolation": "bicubic",
+            "crop_pct": 0.9,
+        }
         args = SimpleNamespace(
             scratch=False,
             vsmr_num_parts=4,
             vsmr_prompt_temperature=1.0,
         )
         model = VSMRViT(args, encoder=encoder)
+        self.assertEqual(model.backbone.input_mean, (0.5, 0.5, 0.5))
+        self.assertEqual(model.backbone.input_std, (0.5, 0.5, 0.5))
+        self.assertEqual(model.backbone.input_interpolation, "bicubic")
+        self.assertEqual(model.backbone.input_crop_pct, 0.9)
         output = model(torch.randn(2, 3, 224, 224))
         self.assertEqual(output["global_features"].shape, (2, 24))
         self.assertEqual(output["parts"].shape, (2, 4, 24))

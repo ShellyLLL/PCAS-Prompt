@@ -46,6 +46,31 @@ class FrozenViTBackbone(nn.Module):
             parameter.requires_grad_(False)
         self.encoder.eval()
 
+        # timm 0.6.12 exposes the resolved checkpoint metadata as default_cfg.
+        # Read it from the instantiated model so preprocessing follows the
+        # actual ViT-B/16 weights rather than the downstream dataset defaults.
+        pretrained_cfg = getattr(self.encoder, "pretrained_cfg", None)
+        if not isinstance(pretrained_cfg, dict):
+            pretrained_cfg = getattr(self.encoder, "default_cfg", {})
+        if not isinstance(pretrained_cfg, dict):
+            pretrained_cfg = {}
+        self.input_mean = tuple(float(x) for x in pretrained_cfg.get(
+            "mean", (0.5, 0.5, 0.5)
+        ))
+        self.input_std = tuple(float(x) for x in pretrained_cfg.get(
+            "std", (0.5, 0.5, 0.5)
+        ))
+        self.input_interpolation = str(
+            pretrained_cfg.get("interpolation", "bicubic")
+        ).lower()
+        self.input_crop_pct = float(pretrained_cfg.get("crop_pct", 0.9))
+        if len(self.input_mean) != 3 or len(self.input_std) != 3:
+            raise RuntimeError("ViT preprocessing config must define RGB mean/std.")
+        if any(value <= 0 for value in self.input_std):
+            raise RuntimeError("ViT preprocessing standard deviations must be positive.")
+        if not 0.0 < self.input_crop_pct <= 1.0:
+            raise RuntimeError("ViT preprocessing crop_pct must be in (0,1].")
+
     def train(self, mode=True):
         super().train(mode)
         self.encoder.eval()

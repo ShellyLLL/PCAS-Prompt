@@ -2,6 +2,12 @@
 
 The default method on \`dev\` is VSMR. The unified implementation is developed from \`dev\` and keeps the pretrained ImageNet-21K ViT-B/16 frozen in every session.
 
+## 0. Frozen-backbone preprocessing contract
+
+VSMR reads the mean, standard deviation, interpolation mode, and crop percentage from the instantiated pretrained ViT checkpoint configuration. The same transform is applied when extracting base-training features, building the base memory, extracting incremental support features, and evaluating seen classes. Dataset-specific CIFAR/ImageNet normalization is not substituted for the checkpoint's input statistics.
+
+For the repository's ImageNet-21K ViT-B/16 configuration, the input mean/std and resize/crop policy follow that checkpoint's timm metadata. If a checkpoint does not expose valid RGB statistics, VSMR uses the explicit fallback mean/std of 0.5/0.5 and validates the resulting transform.
+
 ## 1. Architecture and information flow
 
 ### 1.1 Frozen visual backbone
@@ -163,7 +169,7 @@ Logs include:
 - novel-to-base error;
 - learned transfer alpha/reliability and source-class/component IDs;
 - transfer gain over raw novel prototypes;
-- Q/K/V + OT gain over fixed-index matching;
+- Q/K/V + OT gain over fixed-index matching. The fixed-index ablation uses the exact same query-conditioned Q/K/V reconstruction and changes only the final matching rule, so the comparison isolates OT alignment rather than removing reconstruction;
 - Average Accuracy (AA) and Performance Drop (PD).
 
 The controlled diagnostics use test labels only to calculate metrics. They are not used for gradient updates or hyperparameter selection. A positive transfer or reconstruction gain is not guaranteed and must be reported across datasets and random seeds.

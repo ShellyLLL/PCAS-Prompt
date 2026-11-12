@@ -219,6 +219,44 @@ def query_conditioned_reconstruction(
     )
 
 
+def query_conditioned_fixed_index_reconstruction(
+    query_parts,
+    query_patches,
+    class_parts,
+    reconstructor,
+    scale=16.0,
+):
+    """Fixed-index matching ablation using the exact same Q/K/V reconstruction.
+
+    Only the matching rule differs from query_conditioned_reconstruction:
+    the same query-conditioned class representations are compared to query
+    components at their shared Prompt indices, rather than being OT-aligned.
+    The score is negative mean cosine distance so its range and direction are
+    comparable to the negative OT-cost score.
+    """
+    if query_parts.ndim != 3 or query_patches.ndim != 3:
+        raise ValueError("Expected query parts [B,K,D] and patches [B,N,D].")
+    if query_parts.shape[0] != query_patches.shape[0]:
+        raise ValueError("Query parts and Patch tokens must share batch size.")
+    if query_parts.shape[-1] != query_patches.shape[-1]:
+        raise ValueError("Query parts and Patch tokens must share embedding dimension.")
+    if class_parts.ndim not in (3, 4):
+        raise ValueError("class_parts must be [C,K,D] or [B,C,K,D].")
+    if class_parts.shape[-2:] != query_parts.shape[-2:]:
+        raise ValueError("Query and class component shapes must match.")
+    if not torch.isfinite(query_parts).all() or not torch.isfinite(query_patches).all():
+        raise ValueError("Query features contain non-finite values.")
+    if not torch.isfinite(class_parts).all() or not torch.isfinite(torch.as_tensor(scale)):
+        raise ValueError("Class features or scale contain non-finite values.")
+
+    reconstructed, attention = reconstructor(query_patches, class_parts)
+    query = F.normalize(query_parts, dim=-1).unsqueeze(1)
+    reconstructed = F.normalize(reconstructed, dim=-1)
+    cosine = F.cosine_similarity(query, reconstructed, dim=-1)
+    scores = -(1.0 - cosine).mean(dim=-1) * float(scale)
+    return scores, reconstructed, attention
+
+
 def local_leave_one_out_query_logits(
     parts,
     query_patches,
