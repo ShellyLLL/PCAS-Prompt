@@ -16,11 +16,32 @@ def get_command_line_parser():
     parser.add_argument('-project', type=str, default=PROJECT)
     parser.add_argument('-dataroot', type=str, default=DATA_DIR)
     parser.add_argument('-out', type=str, default='PCAS_APL_PRSN')
-    parser.add_argument('--method', type=str, default='apl_prsn', choices=['apl_prsn', 'pcas', 'lsp_proto', 'prompt_slot_ot'],
-                        help='Use unified APL part learning + PRSN prototype resynthesis (default). Legacy methods remain explicit baselines.')
+    parser.add_argument('--method', type=str, default='vsmr', choices=['vsmr', 'apl_prsn', 'pcas', 'lsp_proto', 'prompt_slot_ot'],
+                        help='Use the unified visual semantic decomposition and prototype reconstruction method (default). Legacy methods remain explicit baselines.')
     parser.add_argument('--index_list_root', type=str,
                         default=os.environ.get("FSCIL_INDEX_LIST_ROOT"),
                         help='Session split root. Defaults to <dataroot>/index_list.')
+    parser.add_argument('--vsmr_num_parts', type=int, default=6)
+    parser.add_argument('--vsmr_classes_per_batch', type=int, default=16)
+    parser.add_argument('--vsmr_samples_per_class', type=int, default=4)
+    parser.add_argument('--vsmr_lr', type=float, default=2e-4)
+    parser.add_argument('--vsmr_weight_decay', type=float, default=1e-4)
+    parser.add_argument('--vsmr_ot_epsilon', type=float, default=0.05)
+    parser.add_argument('--vsmr_sinkhorn_iterations', type=int, default=30)
+    parser.add_argument('--vsmr_barycenter_iterations', type=int, default=5)
+    parser.add_argument('--vsmr_local_temperature', type=float, default=0.1)
+    parser.add_argument('--vsmr_local_weight', type=float, default=1.0)
+    parser.add_argument('--vsmr_alignment_weight', type=float, default=0.2)
+    parser.add_argument('--vsmr_cisa_weight', type=float, default=0.1)
+    parser.add_argument('--vsmr_overlap_weight', type=float, default=0.01)
+    parser.add_argument('--vsmr_logit_scale', type=float, default=16.0)
+    parser.add_argument('--vsmr_global_weight', type=float, default=0.5)
+    parser.add_argument('--vsmr_local_weight_eval', type=float, default=0.5)
+    parser.add_argument('--vsmr_transfer_top_r', type=int, default=5)
+    parser.add_argument('--vsmr_transfer_alpha_max', type=float, default=0.5)
+    parser.add_argument('--vsmr_transfer_temperature', type=float, default=0.1)
+    parser.add_argument('--vsmr_transfer_variance_scale', type=float, default=0.25)
+    parser.add_argument('--vsmr_eval_batch_size', type=int, default=8)
     parser.add_argument('--apl_num_parts', type=int, default=6)
     parser.add_argument('--apl_num_heads', type=int, default=12)
     parser.add_argument('--apl_prior_ratio', type=float, default=0.20)
@@ -213,7 +234,9 @@ if __name__ == '__main__':
     pprint(vars(args))
     args.num_gpu = set_gpu(args)
 
-    if args.method == 'apl_prsn':
+    if args.method == 'vsmr':
+        trainer = importlib.import_module('models.%s.vsmr_trainer' % (args.project)).VSMRFSCILTrainer(args)
+    elif args.method == 'apl_prsn':
         trainer = importlib.import_module('models.%s.apl_prsn_trainer' % (args.project)).APLPRSNFSCILTrainer(args)
     elif args.method == 'pcas':
         trainer = importlib.import_module('models.%s.pcas_trainer' % (args.project)).PCASFSCILTrainer(args)
