@@ -442,13 +442,20 @@ class VSMRFSCILTrainer:
     def _audit_support_test_paths(self, support_set, testset, session):
         if not hasattr(support_set, "data") or not hasattr(testset, "data"):
             return
+        support_items = list(support_set.data)
+        test_items = list(testset.data)
+        if not support_items or not test_items:
+            return
+        path_types = (str, bytes, os.PathLike)
+        if not all(isinstance(path, path_types) for path in support_items + test_items):
+            return
         support_paths = [
-            os.path.realpath(os.path.expanduser(str(path)))
-            for path in support_set.data
+            os.path.realpath(os.path.expanduser(os.fsdecode(path)))
+            for path in support_items
         ]
         test_paths = [
-            os.path.realpath(os.path.expanduser(str(path)))
-            for path in testset.data
+            os.path.realpath(os.path.expanduser(os.fsdecode(path)))
+            for path in test_items
         ]
         if len(set(support_paths)) != len(support_paths):
             raise RuntimeError("Session {} has duplicate support image paths.".format(session))
