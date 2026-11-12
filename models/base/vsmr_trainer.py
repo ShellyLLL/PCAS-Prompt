@@ -369,7 +369,7 @@ class VSMRFSCILTrainer:
         if wg < 0 or wl < 0 or wg + wl <= 0:
             raise ValueError("Global/local classification weights are invalid.")
         pred, target = [], []
-        transfer_scores, no_transfer_scores, fixed_scores = [], [], []
+        transfer_scores, no_transfer_scores, fixed_scores, ot_entropies = [], [], [], []
         self.model.eval()
         try:
             for images, labels in tqdm(loader, desc="VSMR eval session {}".format(session)):
@@ -382,6 +382,10 @@ class VSMRFSCILTrainer:
                     qp, self.all_parts, eps, steps
                 )
                 local_score = local_score * scale
+                transport_entropy = -(
+                    transport.clamp_min(1e-8) * transport.clamp_min(1e-8).log()
+                ).sum(dim=(-1, -2)).mean(dim=-1)
+                ot_entropies.append(transport_entropy.cpu())
                 logits = (wg * gl + wl * local_score) / (wg + wl)
                 pred.append(logits.argmax(1).cpu())
                 target.append(labels.cpu())
@@ -429,6 +433,7 @@ class VSMRFSCILTrainer:
                 (transferred_local.argmax(1) == labels).float().mean()
                 - (fixed_local.argmax(1) == labels).float().mean()
             ),
+            "query_ot_assignment_entropy": float(torch.cat(ot_entropies).mean()),
         }
         return metrics
 
@@ -475,6 +480,10 @@ class VSMRFSCILTrainer:
             "transfer_reliability_mean": float(reliability.mean()),
             "transfer_selected_base_components": int(selected.numel()),
             "transfer_unique_base_components": int(torch.unique(selected).numel()),
+            "transfer_selected_component_ids": selected.cpu().tolist(),
+            "transfer_selected_base_class_ids": self.base_owner[selected].cpu().tolist(),
+            "transfer_alpha_per_class": alpha.mean(dim=1).cpu().tolist(),
+            "transfer_reliability_per_class": reliability.mean(dim=1).cpu().tolist(),
         })
         self._append_log(metrics)
 
