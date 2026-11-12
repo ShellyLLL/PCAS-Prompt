@@ -138,6 +138,7 @@ class VSMRFSCILTrainer:
         self.base_bank = None
         self.all_global = None
         self.all_parts = None
+        self.all_raw_parts = None
 
     @staticmethod
     def _set_seed(seed):
@@ -344,6 +345,7 @@ class VSMRFSCILTrainer:
         )
         self.all_global = self.base_global.clone()
         self.all_parts = self.base_parts.clone()
+        self.all_raw_parts = self.base_parts.clone()
         self._append_log({
             "stage": "base_memory",
             "base_classes": int(self.base_global.shape[0]),
@@ -364,7 +366,7 @@ class VSMRFSCILTrainer:
         steps = int(getattr(self.args, "vsmr_sinkhorn_iterations", 30))
         scale = float(getattr(self.args, "vsmr_logit_scale", 16.0))
         wg = float(getattr(self.args, "vsmr_global_weight", 0.5))
-        wl = float(getattr(self.args, "vsmr_local_weight", 0.5))
+        wl = float(getattr(self.args, "vsmr_local_weight_eval", 0.5))
         if wg < 0 or wl < 0 or wg + wl <= 0:
             raise ValueError("Global/local classification weights are invalid.")
         pred, target = [], []
@@ -391,14 +393,16 @@ class VSMRFSCILTrainer:
                          F.normalize(self.all_parts, dim=-1)[None]).sum(-1).mean(-1)
                 fixed_scores.append(fixed.cpu())
                 transfer_scores.append(local_score.cpu())
-                no_transfer_proto = self.all_parts
                 no_transfer = query_conditioned_reconstruction(
-                    qp, no_transfer_proto, eps, steps
+                    qp, self.all_raw_parts, eps, steps
                 )[0] * scale
                 no_transfer_scores.append(no_transfer.cpu())
         finally:
             testset.transform = original
         predictions, labels = torch.cat(pred), torch.cat(target)
+        transferred_local = torch.cat(transfer_scores)
+        raw_local = torch.cat(no_transfer_scores)
+        fixed_local = torch.cat(fixed_scores)
         counts = torch.bincount(labels, minlength=int(seen_classes))
         if labels.numel() == 0 or torch.any(counts[:int(seen_classes)] == 0):
             raise RuntimeError("Session {} evaluation misses seen classes.".format(session))
@@ -414,6 +418,18 @@ class VSMRFSCILTrainer:
             "base_accuracy": base_acc, "novel_accuracy": novel_acc,
             "novel_to_base_error": float((predictions[novel_mask] < int(self.args.base_class)).float().mean()) if novel_mask.any() else float("nan"),
             "evaluation_samples": int(labels.numel()),
+            "local_accuracy_after_transfer": float((transferred_local.argmax(1) == labels).float().mean()),
+            "local_accuracy_before_transfer": float((raw_local.argmax(1) == labels).float().mean()),
+            "local_transfer_gain": float(
+                (transferred_local.argmax(1) == labels).float().mean()
+                - (raw_local.argmax(1) == labels).float().mean()
+            ),
+            "query_ot_local_accuracy": float((transferred_local.argmax(1) == labels).float().mean()),
+            "fixed_index_local_accuracy": float((fixed_local.argmax(1) == labels).float().mean()),
+            "query_ot_vs_fixed_index_gain": float(
+                (transferred_local.argmax(1) == labels).float().mean()
+                - (fixed_local.argmax(1) == labels).float().mean()
+            ),
         }
         return metrics
 
@@ -449,6 +465,7 @@ class VSMRFSCILTrainer:
         )
         self.all_global = torch.cat([self.all_global, new_global], dim=0)
         self.all_parts = torch.cat([self.all_parts, composed], dim=0)
+        self.all_raw_parts = torch.cat([self.all_raw_parts, raw_new_parts], dim=0)
         if not torch.equal(self.all_global[:old_global.shape[0]], old_global):
             raise RuntimeError("Append-only contract violated: old global memory changed.")
         if not torch.equal(self.all_parts[:old_parts.shape[0]], old_parts):
@@ -493,6 +510,7 @@ class VSMRFSCILTrainer:
             "base_parts": self.base_parts.cpu(),
             "all_global": self.all_global.cpu(),
             "all_parts": self.all_parts.cpu(),
+            "all_raw_parts": self.all_raw_parts.cpu(),
             "summary": summary,
             "results": self.results,
         }, os.path.join(self.save_dir, "vsmr_final.pth"))
