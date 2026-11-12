@@ -99,56 +99,65 @@ def leave_one_out_global(features, labels):
 
 def local_leave_one_out_logits(parts, labels, epsilon=0.05, iterations=30,
                                logit_scale=16.0, barycenter_iterations=5):
-    """Query-conditioned local logits against OT class barycenters.
+    """Vectorized query-conditioned local logits against OT class barycenters.
 
-    The target-class barycenter excludes the query. Other class barycenters
-    use all batch samples of that class. Query-conditioned OT assignments
-    reconstruct values only from the candidate class prototype set, exactly
-    as in incremental inference.
+    Each query's target-class barycenter excludes that query; other classes
+    use all batch samples. The reconstruction operation is identical to
+    incremental inference, and all query/class OT plans are solved in batch.
     """
     if parts.ndim != 3 or labels.ndim != 1 or parts.shape[0] != labels.numel():
         raise ValueError("Expected parts [B,K,D] and labels [B].")
     labels = labels.long()
-    classes = torch.unique(labels, sorted=True)
+    classes, inverse = torch.unique(labels, sorted=True, return_inverse=True)
     class_indices = {
         int(cls): torch.nonzero(labels == cls, as_tuple=False).flatten()
         for cls in classes
     }
     if any(indices.numel() < 2 for indices in class_indices.values()):
         raise ValueError("Each class requires at least two samples for local LOO.")
-    full_prototypes = {
-        int(cls): ot_barycenter(
-            parts[indices], epsilon, iterations,
+
+    full_prototypes = torch.stack([
+        ot_barycenter(
+            parts[class_indices[int(cls)]], epsilon, iterations,
             outer_iterations=barycenter_iterations
         )
-        for cls, indices in class_indices.items()
-    }
-    rows = []
-    k = parts.shape[1]
+        for cls in classes
+    ])
+    loo_prototypes = []
     for sample_index in range(parts.shape[0]):
-        row_scores = []
-        own_class = int(labels[sample_index])
-        query = F.normalize(parts[sample_index:sample_index + 1], dim=-1)
-        for cls in classes:
-            cls_id = int(cls)
-            indices = class_indices[cls_id]
-            if cls_id == own_class:
-                retained = indices[indices != sample_index]
-                prototype = ot_barycenter(
-                    parts[retained], epsilon, iterations,
-                    outer_iterations=barycenter_iterations
-                )
-            else:
-                prototype = full_prototypes[cls_id]
-            prototype = F.normalize(prototype.unsqueeze(0), dim=-1)
-            cost = pairwise_component_cost(query, prototype)
-            transport = sinkhorn_transport(cost, epsilon, iterations)
-            reconstructed = torch.matmul(transport * float(k), prototype)
-            reconstructed = F.normalize(reconstructed, dim=-1)
-            similarity = F.cosine_similarity(query, reconstructed, dim=-1).mean()
-            row_scores.append(similarity * float(logit_scale))
-        rows.append(torch.stack(row_scores))
-    return torch.stack(rows, dim=0), classes
+        cls_id = int(labels[sample_index])
+        retained = class_indices[cls_id]
+        retained = retained[retained != sample_index]
+        loo_prototypes.append(ot_barycenter(
+            parts[retained], epsilon, iterations,
+            outer_iterations=barycenter_iterations
+        ))
+    loo_prototypes = torch.stack(loo_prototypes)
+
+    batch_size, num_parts, feature_dim = parts.shape
+    candidate_prototypes = full_prototypes.unsqueeze(0).expand(
+        batch_size, classes.numel(), num_parts, feature_dim
+    ).clone()
+    batch_indices = torch.arange(batch_size, device=parts.device)
+    candidate_prototypes[batch_indices, inverse] = loo_prototypes
+
+    query = F.normalize(parts, dim=-1)
+    query = query[:, None].expand(
+        batch_size, classes.numel(), num_parts, feature_dim
+    ).reshape(-1, num_parts, feature_dim)
+    prototypes = F.normalize(candidate_prototypes, dim=-1).reshape(
+        -1, num_parts, feature_dim
+    )
+    cost = pairwise_component_cost(query, prototypes)
+    transport = sinkhorn_transport(cost, epsilon, iterations)
+    reconstructed = F.normalize(
+        torch.matmul(transport * float(num_parts), prototypes), dim=-1
+    )
+    similarity = F.cosine_similarity(query, reconstructed, dim=-1)
+    scores = similarity.reshape(
+        batch_size, classes.numel(), num_parts
+    ).mean(dim=-1) * float(logit_scale)
+    return scores, classes
 
 def js_divergence(p_logits, q_logits):
     """Symmetric Jensen-Shannon divergence between two categorical logits."""
