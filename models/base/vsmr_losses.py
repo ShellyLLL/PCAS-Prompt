@@ -194,16 +194,19 @@ def global_logits(features, prototypes, scale=16.0):
 
 def local_logits(query_parts, class_prototypes, epsilon=0.05,
                  iterations=30, scale=16.0):
-    """OT local logits against [C,K,D] class prototype sets."""
+    """Query-conditioned local scores, identical to incremental reconstruction."""
     if query_parts.ndim != 3 or class_prototypes.ndim != 3:
         raise ValueError("Expected query [B,K,D] and prototypes [C,K,D].")
     if query_parts.shape[1:] != class_prototypes.shape[1:]:
         raise ValueError("Query and class component dimensions must match.")
     batch, k, dim = query_parts.shape
     classes = class_prototypes.shape[0]
-    q = F.normalize(query_parts, dim=-1)
-    p = F.normalize(class_prototypes, dim=-1)
-    q = q[:, None].expand(batch, classes, k, dim).reshape(-1, k, dim)
-    p = p[None].expand(batch, classes, k, dim).reshape(-1, k, dim)
-    distances = ot_distance(q, p, epsilon, iterations).reshape(batch, classes)
-    return -distances * float(scale)
+    query = F.normalize(query_parts, dim=-1)
+    prototypes = F.normalize(class_prototypes, dim=-1)
+    q = query[:, None].expand(batch, classes, k, dim).reshape(-1, k, dim)
+    p = prototypes[None].expand(batch, classes, k, dim).reshape(-1, k, dim)
+    cost = pairwise_component_cost(q, p)
+    transport = sinkhorn_transport(cost, epsilon, iterations)
+    reconstructed = F.normalize(torch.matmul(transport * float(k), p), dim=-1)
+    similarity = F.cosine_similarity(q, reconstructed, dim=-1)
+    return similarity.reshape(batch, classes, k).mean(dim=-1) * float(scale)
