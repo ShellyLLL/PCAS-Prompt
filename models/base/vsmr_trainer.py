@@ -225,7 +225,6 @@ class VSMRFSCILTrainer:
         )
         eps = float(getattr(self.args, "vsmr_ot_epsilon", 0.05))
         sinkhorn_steps = int(getattr(self.args, "vsmr_sinkhorn_iterations", 30))
-        temperature = float(getattr(self.args, "vsmr_local_temperature", 0.1))
         w_local = float(getattr(self.args, "vsmr_local_weight", 1.0))
         w_align = float(getattr(self.args, "vsmr_alignment_weight", 0.2))
         w_cisa = float(getattr(self.args, "vsmr_cisa_weight", 0.1))
