@@ -119,11 +119,11 @@ def leave_one_out_global(features, labels):
 
 def local_leave_one_out_logits(parts, labels, epsilon=0.05, iterations=30,
                                logit_scale=16.0, barycenter_iterations=5):
-    """Vectorized query-conditioned local logits against OT class barycenters.
+    """Component-only OT baseline logits with leave-one-out prototypes.
 
-    Each query's target-class barycenter excludes that query; other classes
-    use all batch samples. The reconstruction operation is identical to
-    incremental inference, and all query/class OT plans are solved in batch.
+    This helper is retained for ablation tests. The default VSMR computation
+    graph uses local_leave_one_out_query_logits in vsmr_resynthesis.py, which
+    additionally performs query-Patch Q/K/V reconstruction before OT.
     """
     if parts.ndim != 3 or labels.ndim != 1 or parts.shape[0] != labels.numel():
         raise ValueError("Expected parts [B,K,D] and labels [B].")
@@ -225,7 +225,12 @@ def global_logits(features, prototypes, scale=16.0):
 
 def local_logits(query_parts, class_prototypes, epsilon=0.05,
                  iterations=30, scale=16.0):
-    """Query-conditioned local scores, identical to incremental reconstruction."""
+    """Component-only OT baseline scores without query-Patch reconstruction.
+
+    The default VSMR trainer uses query_conditioned_reconstruction from
+    vsmr_resynthesis.py so training and incremental inference share the
+    learned query-Patch Q/K/V reconstruction path.
+    """
     if query_parts.ndim != 3 or class_prototypes.ndim != 3:
         raise ValueError("Expected query [B,K,D] and prototypes [C,K,D].")
     if query_parts.shape[1:] != class_prototypes.shape[1:]:

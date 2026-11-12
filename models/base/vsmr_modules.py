@@ -36,15 +36,51 @@ class FrozenViTBackbone(nn.Module):
                     getattr(self.encoder, "embed_dim", 768))
         )
         if encoder is None:
-            if self.embed_dim != 768 or len(self.encoder.blocks) != 12:
+            patch_size = getattr(
+                getattr(self.encoder, "patch_embed", None), "patch_size", None
+            )
+            if isinstance(patch_size, int):
+                patch_size = (patch_size, patch_size)
+            elif patch_size is not None:
+                patch_size = tuple(patch_size)
+            if (
+                self.embed_dim != 768
+                or len(self.encoder.blocks) != 12
+                or patch_size != (16, 16)
+            ):
                 raise RuntimeError(
                     "VSMR requires the repository's pretrained ViT-B/16 "
-                    "(768 dimensions and 12 Transformer blocks)."
+                    "(patch 16, 768 dimensions and 12 Transformer blocks)."
                 )
 
         for parameter in self.encoder.parameters():
             parameter.requires_grad_(False)
         self.encoder.eval()
+
+        # timm 0.6.12 exposes the resolved checkpoint metadata as default_cfg.
+        # Read it from the instantiated model so preprocessing follows the
+        # actual ViT-B/16 weights rather than the downstream dataset defaults.
+        pretrained_cfg = getattr(self.encoder, "pretrained_cfg", None)
+        if not isinstance(pretrained_cfg, dict) or "mean" not in pretrained_cfg:
+            pretrained_cfg = getattr(self.encoder, "default_cfg", {})
+        if not isinstance(pretrained_cfg, dict):
+            pretrained_cfg = {}
+        self.input_mean = tuple(float(x) for x in pretrained_cfg.get(
+            "mean", (0.5, 0.5, 0.5)
+        ))
+        self.input_std = tuple(float(x) for x in pretrained_cfg.get(
+            "std", (0.5, 0.5, 0.5)
+        ))
+        self.input_interpolation = str(
+            pretrained_cfg.get("interpolation", "bicubic")
+        ).lower()
+        self.input_crop_pct = float(pretrained_cfg.get("crop_pct", 0.9))
+        if len(self.input_mean) != 3 or len(self.input_std) != 3:
+            raise RuntimeError("ViT preprocessing config must define RGB mean/std.")
+        if any(value <= 0 for value in self.input_std):
+            raise RuntimeError("ViT preprocessing standard deviations must be positive.")
+        if not 0.0 < self.input_crop_pct <= 1.0:
+            raise RuntimeError("ViT preprocessing crop_pct must be in (0,1].")
 
     def train(self, mode=True):
         super().train(mode)
@@ -128,8 +164,150 @@ class VisualSemanticDecomposer(nn.Module):
         return global_features, local_parts, attention
 
 
+class ReliabilityGate(nn.Module):
+    """Learned component-wise transfer reliability gate.
+
+    Inputs are entirely visual: novel component, retrieved base component,
+    their interaction/difference, retrieval confidence/ambiguity, support
+    dispersion, and the number of support shots.
+    """
+
+    def __init__(self, embed_dim=768, hidden_dim=None):
+        super().__init__()
+        embed_dim = int(embed_dim)
+        hidden_dim = int(hidden_dim or max(128, embed_dim // 2))
+        input_dim = 4 * embed_dim + 5
+        self.input_dim = input_dim
+        self.network = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        # Conservative initial transfer; the gate is subsequently learned
+        # from pseudo-incremental classification episodes.
+        nn.init.constant_(self.network[-1].bias, -1.5)
+
+    @staticmethod
+    def _scalar_feature(value, reference, name):
+        if value is None:
+            return torch.zeros_like(reference)
+        if not torch.is_tensor(value):
+            value = reference.new_tensor(float(value))
+        else:
+            value = value.to(device=reference.device, dtype=reference.dtype)
+        if value.ndim == 0:
+            return value.expand_as(reference)
+        if value.ndim == 1 and value.shape[0] == reference.shape[0]:
+            return value[:, None].expand_as(reference)
+        if value.shape != reference.shape:
+            raise ValueError("{} must be scalar, [C], or [C,K].".format(name))
+        return value
+
+    def forward(self, novel, retrieved, mean_similarity, similarity_margin,
+                retrieval_entropy, support_variance=None, shots=1):
+        if novel.ndim != 3 or retrieved.shape != novel.shape:
+            raise ValueError("Gate inputs must share [C,K,D] shapes.")
+        reference = mean_similarity
+        margin = self._scalar_feature(
+            similarity_margin, reference, "similarity_margin"
+        )
+        entropy = self._scalar_feature(
+            retrieval_entropy, reference, "retrieval_entropy"
+        )
+        variance = self._scalar_feature(
+            support_variance, reference, "support_variance"
+        )
+        shot_values = self._scalar_feature(shots, reference, "shots")
+        log_shots = shot_values.clamp_min(1.0).log()
+
+        features = torch.cat([
+            novel,
+            retrieved,
+            novel * retrieved,
+            (novel - retrieved).abs(),
+            reference.unsqueeze(-1),
+            margin.unsqueeze(-1),
+            entropy.unsqueeze(-1),
+            variance.unsqueeze(-1),
+            log_shots.unsqueeze(-1),
+        ], dim=-1)
+        if features.shape[-1] != self.input_dim:
+            raise RuntimeError("Reliability gate feature dimension mismatch.")
+        return torch.sigmoid(self.network(features).squeeze(-1))
+
+
+class QueryConditionedReconstructor(nn.Module):
+    """Cross-attention reconstruction of class parts from query Patch tokens.
+
+    Class prototypes provide the queries/residual content. Query Patch tokens
+    provide keys and values. The output is ephemeral and never written back to
+    persistent class memory.
+    """
+
+    def __init__(self, embed_dim=768):
+        super().__init__()
+        self.embed_dim = int(embed_dim)
+        self.query_projection = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.key_projection = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.value_projection = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.norm = nn.LayerNorm(self.embed_dim)
+
+    def forward(self, query_patches, class_parts):
+        if query_patches.ndim != 3:
+            raise ValueError("query_patches must have shape [B,N,D].")
+        if class_parts.ndim not in (3, 4):
+            raise ValueError("class_parts must have shape [C,K,D] or [B,C,K,D].")
+        batch, num_patches, dim = query_patches.shape
+        if dim != self.embed_dim or class_parts.shape[-1] != self.embed_dim:
+            raise ValueError("Query and prototype embedding dimensions must match.")
+        if class_parts.ndim == 3:
+            class_parts = class_parts.unsqueeze(0).expand(
+                batch, -1, -1, -1
+            )
+        elif class_parts.shape[0] != batch:
+            raise ValueError("Per-query class prototypes must match query batch size.")
+
+        queries = self.query_projection(class_parts)
+        keys = self.key_projection(query_patches)
+        values = self.value_projection(query_patches)
+        logits = torch.einsum("bckd,bnd->bckn", queries, keys)
+        logits = logits / math.sqrt(self.embed_dim)
+        attention = torch.softmax(logits, dim=-1)
+        context = torch.einsum("bckn,bnd->bckd", attention, values)
+        reconstructed = self.norm(queries + context)
+        reconstructed = F.normalize(reconstructed, p=2, dim=-1)
+        return reconstructed, attention
+
+
+class GlobalLocalFusion(nn.Module):
+    """Learn a single global/local mixture coefficient during base training."""
+
+    def __init__(self, global_init=0.5, local_init=0.5):
+        super().__init__()
+        global_init = float(global_init)
+        local_init = float(local_init)
+        if global_init < 0 or local_init < 0 or global_init + local_init <= 0:
+            raise ValueError("Initial global/local fusion weights are invalid.")
+        alpha = global_init / (global_init + local_init)
+        alpha = min(max(alpha, 1e-4), 1.0 - 1e-4)
+        self.logit = nn.Parameter(torch.tensor(
+            math.log(alpha / (1.0 - alpha)), dtype=torch.float32
+        ))
+
+    @property
+    def alpha(self):
+        return torch.sigmoid(self.logit)
+
+    def forward(self, global_scores, local_scores):
+        if global_scores.shape != local_scores.shape:
+            raise ValueError("Global and local scores must have identical shapes.")
+        alpha = self.alpha.to(dtype=global_scores.dtype)
+        return alpha * global_scores + (1.0 - alpha) * local_scores
+
+
 class VSMRViT(nn.Module):
-    """Frozen ViT plus shared visual-semantic decomposition."""
+    """Frozen ViT plus shared decomposition, learned gate and query reconstructor."""
 
     def __init__(self, args, encoder=None):
         super().__init__()
@@ -139,10 +317,20 @@ class VSMRViT(nn.Module):
                 "scratch backbone initialization is not supported."
             )
         self.backbone = FrozenViTBackbone(pretrained=True, encoder=encoder)
+        dim = self.backbone.embed_dim
         self.decomposer = VisualSemanticDecomposer(
-            embed_dim=self.backbone.embed_dim,
+            embed_dim=dim,
             num_parts=int(getattr(args, "vsmr_num_parts", 6)),
             temperature=float(getattr(args, "vsmr_prompt_temperature", 1.0)),
+        )
+        self.reliability_gate = ReliabilityGate(
+            embed_dim=dim,
+            hidden_dim=int(getattr(args, "vsmr_gate_hidden_dim", max(128, dim // 2))),
+        )
+        self.reconstructor = QueryConditionedReconstructor(embed_dim=dim)
+        self.fusion = GlobalLocalFusion(
+            global_init=float(getattr(args, "vsmr_global_weight", 0.5)),
+            local_init=float(getattr(args, "vsmr_local_weight_eval", 0.5)),
         )
         self._incremental_frozen = False
 
@@ -151,6 +339,9 @@ class VSMRViT(nn.Module):
         self.backbone.eval()
         if self._incremental_frozen:
             self.decomposer.eval()
+            self.reliability_gate.eval()
+            self.reconstructor.eval()
+            self.fusion.eval()
         return self
 
     def forward(self, images):
@@ -162,10 +353,14 @@ class VSMRViT(nn.Module):
             "global_features": global_features,
             "parts": parts,
             "attention": attention,
+            "patch_features": patch_features,
         }
 
     def freeze_for_incremental(self):
         """Freeze every learned component before the first incremental session."""
         self._incremental_frozen = True
         self.decomposer.requires_grad_(False)
+        self.reliability_gate.requires_grad_(False)
+        self.reconstructor.requires_grad_(False)
+        self.fusion.requires_grad_(False)
         self.eval()

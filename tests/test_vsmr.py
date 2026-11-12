@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import transforms
 
 from models.base.vsmr_losses import (
     attention_overlap_loss,
@@ -21,8 +22,16 @@ from models.base.vsmr_losses import (
 )
 from models.base.vsmr_resynthesis import (
     build_base_component_bank,
+    component_support_variance,
     compose_novel_prototypes,
+    local_leave_one_out_query_logits,
+    query_conditioned_fixed_index_reconstruction,
     query_conditioned_reconstruction,
+)
+from models.base.vsmr_modules import (
+    GlobalLocalFusion,
+    QueryConditionedReconstructor,
+    ReliabilityGate,
 )
 from models import model_My
 from models.base.vsmr_modules import VisualSemanticDecomposer, VSMRViT
@@ -83,6 +92,21 @@ class TestOptimalTransport(unittest.TestCase):
         self.assertTrue(torch.isfinite(center).all())
 
 
+class TestGlobalLocalFusion(unittest.TestCase):
+    def test_fusion_is_learned_convex_and_differentiable(self):
+        fusion = GlobalLocalFusion(global_init=0.5, local_init=0.5)
+        global_scores = torch.tensor([[3.0, 0.0], [0.0, 3.0]])
+        local_scores = torch.tensor([[0.0, 3.0], [3.0, 0.0]])
+        fused = fusion(global_scores, local_scores)
+        self.assertTrue(torch.allclose(fused, 0.5 * global_scores + 0.5 * local_scores))
+        self.assertGreater(float(fusion.alpha.item()), 0.0)
+        self.assertLess(float(fusion.alpha.item()), 1.0)
+        targets = torch.tensor([0, 1])
+        F.cross_entropy(fusion(global_scores, local_scores), targets).backward()
+        self.assertIsNotNone(fusion.logit.grad)
+        self.assertGreater(float(fusion.logit.grad.abs().item()), 0.0)
+
+
 class TestVisualSemanticDecomposition(unittest.TestCase):
     def test_vsmr_integrates_with_repository_vit_and_freeze_contract(self):
         # Use the repository's actual ViT implementation with a small shape;
@@ -99,16 +123,27 @@ class TestVisualSemanticDecomposition(unittest.TestCase):
             attn_drop_rate=0.0,
             drop_path_rate=0.0,
         )
+        encoder.default_cfg = {
+            "mean": (0.5, 0.5, 0.5),
+            "std": (0.5, 0.5, 0.5),
+            "interpolation": "bicubic",
+            "crop_pct": 0.9,
+        }
         args = SimpleNamespace(
             scratch=False,
             vsmr_num_parts=4,
             vsmr_prompt_temperature=1.0,
         )
         model = VSMRViT(args, encoder=encoder)
+        self.assertEqual(model.backbone.input_mean, (0.5, 0.5, 0.5))
+        self.assertEqual(model.backbone.input_std, (0.5, 0.5, 0.5))
+        self.assertEqual(model.backbone.input_interpolation, "bicubic")
+        self.assertEqual(model.backbone.input_crop_pct, 0.9)
         output = model(torch.randn(2, 3, 224, 224))
         self.assertEqual(output["global_features"].shape, (2, 24))
         self.assertEqual(output["parts"].shape, (2, 4, 24))
         self.assertEqual(output["attention"].shape, (2, 4, 196))
+        self.assertEqual(output["patch_features"].shape, (2, 196, 24))
         self.assertTrue(all(not p.requires_grad for p in model.backbone.parameters()))
         self.assertTrue(any(p.requires_grad for p in model.decomposer.parameters()))
 
@@ -117,7 +152,13 @@ class TestVisualSemanticDecomposition(unittest.TestCase):
         model.freeze_for_incremental()
         model.train()
         self.assertFalse(model.decomposer.training)
+        self.assertFalse(model.reliability_gate.training)
+        self.assertFalse(model.reconstructor.training)
+        self.assertFalse(model.fusion.training)
         self.assertTrue(all(not p.requires_grad for p in model.decomposer.parameters()))
+        self.assertTrue(all(not p.requires_grad for p in model.reliability_gate.parameters()))
+        self.assertTrue(all(not p.requires_grad for p in model.reconstructor.parameters()))
+        self.assertTrue(all(not p.requires_grad for p in model.fusion.parameters()))
 
     def test_prompt_attention_is_soft_and_differentiable(self):
         torch.manual_seed(11)
@@ -168,8 +209,16 @@ class TestPrototypeAndTransfer(unittest.TestCase):
         base = F.normalize(torch.randn(3, 4, 8), dim=-1)
         bank, owner, part_id = build_base_component_bank(base)
         novel = F.normalize(torch.randn(2, 4, 8), dim=-1)
+        gate = ReliabilityGate(embed_dim=8, hidden_dim=16)
+        support_variance = torch.rand(2, 4)
         composed, alpha, reliability, indices, weights = compose_novel_prototypes(
-            novel, bank, top_r=3
+            novel,
+            bank,
+            gate,
+            base_owner=owner,
+            top_r=3,
+            support_variance=support_variance,
+            shots=torch.tensor([1, 3]),
         )
         self.assertEqual(composed.shape, novel.shape)
         self.assertEqual(alpha.shape, novel.shape[:2])
@@ -180,26 +229,156 @@ class TestPrototypeAndTransfer(unittest.TestCase):
         self.assertEqual(owner.shape, (12,))
         self.assertEqual(part_id.shape, (12,))
         self.assertTrue(torch.isfinite(reliability).all())
+        selected_owners = owner[indices]
+        for row in selected_owners.reshape(-1, selected_owners.shape[-1]):
+            self.assertEqual(torch.unique(row).numel(), row.numel())
 
-    def test_query_reconstruction_values_come_from_class_prototypes(self):
+        target = torch.randn_like(composed)
+        (composed * target).sum().add(alpha.mean()).backward()
+        gate_grad = sum(
+            float(parameter.grad.abs().sum())
+            for parameter in gate.parameters()
+            if parameter.grad is not None
+        )
+        self.assertGreater(gate_grad, 0.0)
+
+    def test_support_variance_is_ot_aligned_and_finite(self):
+        prototype = F.normalize(torch.randn(4, 8), dim=-1)
+        supports = F.normalize(torch.randn(3, 4, 8), dim=-1)
+        variance = component_support_variance(supports, prototype, 0.1, 40)
+        self.assertEqual(variance.shape, (4,))
+        self.assertTrue(torch.isfinite(variance).all())
+        singleton = component_support_variance(supports[:1], prototype)
+        self.assertTrue(torch.equal(singleton, torch.zeros_like(singleton)))
+
+    def test_query_patch_values_condition_reconstructed_class_parts(self):
         query = F.normalize(torch.randn(2, 4, 8), dim=-1)
+        patches = F.normalize(torch.randn(2, 12, 8), dim=-1).requires_grad_()
         prototypes = F.normalize(torch.randn(3, 4, 8), dim=-1)
-        scores, reconstructed, transport = query_conditioned_reconstruction(
-            query, prototypes
+        memory_before = prototypes.clone()
+        reconstructor = QueryConditionedReconstructor(embed_dim=8)
+        scores, reconstructed, transport, attention = query_conditioned_reconstruction(
+            query, patches, prototypes, reconstructor, 0.08, 50, 16.0
         )
         self.assertEqual(scores.shape, (2, 3))
         self.assertEqual(reconstructed.shape, (2, 3, 4, 8))
         self.assertEqual(transport.shape, (2, 3, 4, 4))
-        # Reconstructed values equal normalized query-conditioned weighted
-        # sums of stored class prototype parts; query values are not injected.
-        flat_proto = F.normalize(prototypes, dim=-1)[None].expand(2, -1, -1, -1)
-        expected = torch.matmul(
-            transport.reshape(-1, 4, 4) * 4.0,
-            flat_proto.reshape(-1, 4, 8),
-        )
-        expected = F.normalize(expected, dim=-1).reshape(2, 3, 4, 8)
-        self.assertTrue(torch.allclose(reconstructed, expected, atol=1e-5))
+        self.assertEqual(attention.shape, (2, 3, 4, 12))
         self.assertTrue(torch.isfinite(scores).all())
+        self.assertTrue(torch.equal(prototypes, memory_before))
+
+        changed_patches = patches.detach().clone()
+        changed_patches[:, :6] = -changed_patches[:, :6]
+        changed, _, _, _ = query_conditioned_reconstruction(
+            query, changed_patches, prototypes, reconstructor, 0.08, 50, 16.0
+        )
+        self.assertFalse(torch.allclose(scores, changed, atol=1e-6))
+        (-scores.mean()).backward()
+        self.assertIsNotNone(patches.grad)
+        self.assertTrue(torch.isfinite(patches.grad).all())
+        self.assertIsNotNone(reconstructor.value_projection.weight.grad)
+        self.assertGreater(
+            float(reconstructor.value_projection.weight.grad.abs().sum()), 0.0
+        )
+
+    def test_fixed_index_ablation_uses_same_query_reconstruction(self):
+        query = F.normalize(torch.randn(2, 4, 8), dim=-1).requires_grad_()
+        patches = F.normalize(torch.randn(2, 9, 8), dim=-1).requires_grad_()
+        prototypes = F.normalize(torch.randn(3, 4, 8), dim=-1)
+        reconstructor = QueryConditionedReconstructor(embed_dim=8)
+        scores, reconstructed, attention = query_conditioned_fixed_index_reconstruction(
+            query, patches, prototypes, reconstructor, scale=16.0
+        )
+        self.assertEqual(scores.shape, (2, 3))
+        self.assertEqual(reconstructed.shape, (2, 3, 4, 8))
+        self.assertEqual(attention.shape, (2, 3, 4, 9))
+        self.assertTrue(torch.isfinite(scores).all())
+        (-scores.mean()).backward()
+        self.assertIsNotNone(query.grad)
+        self.assertIsNotNone(patches.grad)
+        self.assertIsNotNone(reconstructor.value_projection.weight.grad)
+
+    def test_local_loo_uses_same_query_reconstruction_path(self):
+        parts = F.normalize(torch.randn(6, 4, 8), dim=-1).requires_grad_()
+        patches = F.normalize(torch.randn(6, 10, 8), dim=-1).requires_grad_()
+        labels = torch.tensor([0, 0, 0, 1, 1, 1])
+        reconstructor = QueryConditionedReconstructor(embed_dim=8)
+        logits, classes = local_leave_one_out_query_logits(
+            parts, patches, labels, reconstructor, 0.08, 40, 16.0, 2
+        )
+        self.assertEqual(logits.shape, (6, 2))
+        self.assertEqual(classes.tolist(), [0, 1])
+        F.cross_entropy(logits, torch.tensor([0, 0, 0, 1, 1, 1])).backward()
+        self.assertIsNotNone(parts.grad)
+        self.assertIsNotNone(patches.grad)
+        self.assertIsNotNone(reconstructor.query_projection.weight.grad)
+
+    def test_pseudo_incremental_episode_trains_gate_and_reconstructor(self):
+        trainer = VSMRFSCILTrainer.__new__(VSMRFSCILTrainer)
+        trainer.args = SimpleNamespace(
+            vsmr_episode_novel_fraction=0.34,
+            vsmr_episode_max_shot=2,
+            vsmr_barycenter_iterations=2,
+            vsmr_transfer_top_r=2,
+            vsmr_transfer_alpha_max=0.5,
+            vsmr_transfer_temperature=0.1,
+            vsmr_global_weight=0.5,
+            vsmr_local_weight_eval=0.5,
+        )
+        gate = ReliabilityGate(embed_dim=8, hidden_dim=16)
+        reconstructor = QueryConditionedReconstructor(embed_dim=8)
+        trainer.model = SimpleNamespace(
+            reliability_gate=gate,
+            reconstructor=reconstructor,
+            fusion=GlobalLocalFusion(),
+        )
+        torch.manual_seed(31)
+        features = F.normalize(torch.randn(12, 8), dim=-1).requires_grad_()
+        parts = F.normalize(torch.randn(12, 4, 8), dim=-1).requires_grad_()
+        patches = F.normalize(torch.randn(12, 10, 8), dim=-1).requires_grad_()
+        labels = torch.tensor([0] * 3 + [1] * 3 + [2] * 3 + [3] * 3)
+        global_loss, local_loss, joint_loss = trainer._pseudo_incremental_episode(
+            features, parts, patches, labels, 0.08, 30, 16.0
+        )
+        total = global_loss + local_loss + joint_loss
+        self.assertTrue(torch.isfinite(total))
+        total.backward()
+        self.assertTrue(any(
+            parameter.grad is not None and parameter.grad.abs().sum() > 0
+            for parameter in gate.parameters()
+        ))
+        self.assertTrue(any(
+            parameter.grad is not None and parameter.grad.abs().sum() > 0
+            for parameter in reconstructor.parameters()
+        ))
+
+
+class TestPreprocessingContract(unittest.TestCase):
+    def test_transform_uses_frozen_backbone_config_for_every_dataset(self):
+        trainer = VSMRFSCILTrainer.__new__(VSMRFSCILTrainer)
+        trainer.args = SimpleNamespace(dataset="cifar100")
+        trainer.model = SimpleNamespace(backbone=SimpleNamespace(
+            input_mean=(0.5, 0.5, 0.5),
+            input_std=(0.5, 0.5, 0.5),
+            input_interpolation="bicubic",
+            input_crop_pct=0.9,
+        ))
+        transform = trainer._transform()
+        resize, crop, to_tensor, normalize = transform.transforms
+        self.assertEqual(resize.size, 249)
+        self.assertEqual(resize.interpolation, transforms.InterpolationMode.BICUBIC)
+        self.assertEqual(crop.size, (224, 224))
+        self.assertEqual(normalize.mean, (0.5, 0.5, 0.5))
+        self.assertEqual(normalize.std, (0.5, 0.5, 0.5))
+
+        training_transform = trainer._training_transform()
+        train_normalize = training_transform.transforms[-1]
+        self.assertEqual(
+            training_transform.transforms[0].interpolation,
+            transforms.InterpolationMode.BICUBIC,
+        )
+        self.assertEqual(train_normalize.mean, (0.5, 0.5, 0.5))
+        self.assertEqual(train_normalize.std, (0.5, 0.5, 0.5))
 
 
 class TestTrainingDataPipeline(unittest.TestCase):
