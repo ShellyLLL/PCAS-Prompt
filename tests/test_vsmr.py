@@ -86,11 +86,14 @@ class TestPrototypeAndTransfer(unittest.TestCase):
         self.assertEqual(inverse.shape, (6,))
 
     def test_local_loo_logits_and_full_logits(self):
-        parts = F.normalize(torch.randn(8, 4, 12), dim=-1)
+        parts = F.normalize(torch.randn(8, 4, 12), dim=-1).requires_grad_()
         labels = torch.tensor([0] * 4 + [1] * 4)
         logits, classes = local_leave_one_out_logits(parts, labels)
         self.assertEqual(logits.shape, (8, 2))
         self.assertTrue(torch.isfinite(logits).all())
+        F.cross_entropy(logits, torch.tensor([0] * 4 + [1] * 4)).backward()
+        self.assertIsNotNone(parts.grad)
+        self.assertTrue(torch.isfinite(parts.grad).all())
         prototypes = torch.stack([
             ot_barycenter(parts[:4]), ot_barycenter(parts[4:])
         ])
