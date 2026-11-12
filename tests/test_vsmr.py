@@ -1,5 +1,6 @@
 """Unit tests for the unified visual-semantic FSCIL components."""
 import unittest
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -20,6 +21,7 @@ from models.base.vsmr_resynthesis import (
     compose_novel_prototypes,
     query_conditioned_reconstruction,
 )
+from models import model_My
 from models.base.vsmr_modules import VisualSemanticDecomposer, VSMRViT
 
 
@@ -55,6 +57,40 @@ class TestOptimalTransport(unittest.TestCase):
 
 
 class TestVisualSemanticDecomposition(unittest.TestCase):
+    def test_vsmr_integrates_with_repository_vit_and_freeze_contract(self):
+        # Use the repository's actual ViT implementation with a small shape;
+        # pretrained weights are intentionally disabled in this unit test.
+        encoder = model_My.vit_base_patch16_224_in21k(
+            pretrained=False,
+            num_classes=0,
+            global_pool="token",
+            embed_dim=24,
+            depth=1,
+            num_heads=3,
+            drop_rate=0.0,
+            attn_drop_rate=0.0,
+            drop_path_rate=0.0,
+        )
+        args = SimpleNamespace(
+            scratch=False,
+            vsmr_num_parts=4,
+            vsmr_prompt_temperature=1.0,
+        )
+        model = VSMRViT(args, encoder=encoder)
+        output = model(torch.randn(2, 3, 224, 224))
+        self.assertEqual(output["global_features"].shape, (2, 24))
+        self.assertEqual(output["parts"].shape, (2, 4, 24))
+        self.assertEqual(output["attention"].shape, (2, 4, 196))
+        self.assertTrue(all(not p.requires_grad for p in model.backbone.parameters()))
+        self.assertTrue(any(p.requires_grad for p in model.decomposer.parameters()))
+
+        model.train()
+        self.assertFalse(model.backbone.encoder.training)
+        model.freeze_for_incremental()
+        model.train()
+        self.assertFalse(model.decomposer.training)
+        self.assertTrue(all(not p.requires_grad for p in model.decomposer.parameters()))
+
     def test_prompt_attention_is_soft_and_differentiable(self):
         torch.manual_seed(11)
         module = VisualSemanticDecomposer(embed_dim=24, num_parts=4)
