@@ -15,13 +15,14 @@ def get_command_line_parser():
     # about dataset and network
     parser.add_argument('-project', type=str, default=PROJECT)
     parser.add_argument('-dataroot', type=str, default=DATA_DIR)
-    parser.add_argument('-out', type=str, default='PCAS_APL_PRSN')
+    parser.add_argument('-out', type=str, default='VSMR')
     parser.add_argument('--method', type=str, default='vsmr', choices=['vsmr', 'apl_prsn', 'pcas', 'lsp_proto', 'prompt_slot_ot'],
                         help='Use the unified visual semantic decomposition and prototype reconstruction method (default). Legacy methods remain explicit baselines.')
     parser.add_argument('--index_list_root', type=str,
                         default=os.environ.get("FSCIL_INDEX_LIST_ROOT"),
                         help='Session split root. Defaults to <dataroot>/index_list.')
     parser.add_argument('--vsmr_num_parts', type=int, default=6)
+    parser.add_argument('--vsmr_prompt_temperature', type=float, default=1.0)
     parser.add_argument('--vsmr_classes_per_batch', type=int, default=16)
     parser.add_argument('--vsmr_samples_per_class', type=int, default=4)
     parser.add_argument('--vsmr_lr', type=float, default=2e-4)
