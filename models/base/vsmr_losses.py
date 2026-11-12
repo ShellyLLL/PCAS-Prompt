@@ -21,6 +21,26 @@ def pairwise_component_cost(query_parts, prototype_parts):
     return (1.0 - torch.matmul(q, p.transpose(1, 2))).clamp_min(0.0)
 
 
+
+def fixed_index_component_logits(query_parts, class_parts, scale=1.0):
+    """Cosine logits for fixed component-index matching [B,K,D] x [C,K,D]."""
+    if query_parts.ndim != 3 or class_parts.ndim != 3:
+        raise ValueError("Expected query [B,K,D] and class parts [C,K,D].")
+    if query_parts.shape[1:] != class_parts.shape[1:]:
+        raise ValueError("Fixed-index matching requires identical [K,D] shapes.")
+    if query_parts.shape[0] == 0 or class_parts.shape[0] == 0:
+        raise ValueError("Fixed-index matching requires non-empty query and classes.")
+    if not torch.isfinite(query_parts).all() or not torch.isfinite(class_parts).all():
+        raise ValueError("Fixed-index matching inputs contain non-finite values.")
+    if not math.isfinite(float(scale)):
+        raise ValueError("Fixed-index matching scale must be finite.")
+    query = F.normalize(query_parts, dim=-1)
+    prototypes = F.normalize(class_parts, dim=-1)
+    return torch.einsum("bkd,ckd->bc", query, prototypes) * (
+        float(scale) / query_parts.shape[1]
+    )
+
+
 def sinkhorn_transport(cost, epsilon=0.05, iterations=30):
     """Entropic OT with uniform marginals; stable log-domain Sinkhorn."""
     if cost.ndim < 2 or cost.shape[-1] != cost.shape[-2]:
