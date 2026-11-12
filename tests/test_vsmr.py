@@ -1,5 +1,7 @@
 """Unit tests for the unified visual-semantic FSCIL components."""
 import unittest
+
+import numpy as np
 from types import SimpleNamespace
 
 import torch
@@ -8,6 +10,7 @@ import torch.nn.functional as F
 
 from models.base.vsmr_losses import (
     attention_overlap_loss,
+    fixed_index_component_logits,
     cross_image_semantic_alignment,
     leave_one_out_global,
     local_leave_one_out_logits,
@@ -24,6 +27,29 @@ from models.base.vsmr_resynthesis import (
 from models import model_My
 from models.base.vsmr_modules import VisualSemanticDecomposer, VSMRViT
 from models.base.vsmr_trainer import ClassBalancedBatchSampler, VSMRFSCILTrainer
+
+
+class TestFixedIndexMatching(unittest.TestCase):
+    def test_fixed_index_logits_support_batch_and_class_axes(self):
+        torch.manual_seed(11)
+        query = torch.randn(8, 6, 32)
+        prototypes = torch.randn(100, 6, 32)
+        logits = fixed_index_component_logits(query, prototypes, 16.0)
+        self.assertEqual(logits.shape, (8, 100))
+        q, p = F.normalize(query, dim=-1), F.normalize(prototypes, dim=-1)
+        expected = torch.einsum("bkd,ckd->bc", q, p) * (16.0 / 6)
+        self.assertTrue(torch.allclose(logits, expected, atol=1e-6))
+
+    def test_fixed_index_matching_rejects_incompatible_parts(self):
+        with self.assertRaises(ValueError):
+            fixed_index_component_logits(torch.randn(2, 6, 8), torch.randn(3, 5, 8))
+
+    def test_fixed_index_matching_is_differentiable(self):
+        query = torch.randn(4, 6, 8, requires_grad=True)
+        prototypes = torch.randn(7, 6, 8, requires_grad=True)
+        fixed_index_component_logits(query, prototypes).square().mean().backward()
+        self.assertTrue(torch.isfinite(query.grad).all())
+        self.assertTrue(torch.isfinite(prototypes.grad).all())
 
 
 class TestOptimalTransport(unittest.TestCase):
