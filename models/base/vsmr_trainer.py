@@ -428,6 +428,18 @@ class VSMRFSCILTrainer:
         novel_mask = ~base_mask
         base_acc = float((predictions[base_mask] == labels[base_mask]).float().mean()) if base_mask.any() else None
         novel_acc = float((predictions[novel_mask] == labels[novel_mask]).float().mean()) if novel_mask.any() else None
+        local_after = transferred_local.argmax(1) == labels
+        local_before = raw_local.argmax(1) == labels
+        local_fixed = fixed_local.argmax(1) == labels
+        joint_after = predictions == labels
+        joint_before = raw_joint_pred == labels
+        joint_fixed = fixed_joint_pred == labels
+        novel_local_after = float(local_after[novel_mask].float().mean()) if novel_mask.any() else None
+        novel_local_before = float(local_before[novel_mask].float().mean()) if novel_mask.any() else None
+        novel_joint_after = float(joint_after[novel_mask].float().mean()) if novel_mask.any() else None
+        novel_joint_before = float(joint_before[novel_mask].float().mean()) if novel_mask.any() else None
+        novel_query_ot = float(joint_after[novel_mask].float().mean()) if novel_mask.any() else None
+        novel_fixed = float(joint_fixed[novel_mask].float().mean()) if novel_mask.any() else None
         metrics = {
             "stage": "evaluation", "session": int(session),
             "sample_accuracy": accuracy, "class_average_accuracy": macro,
@@ -437,19 +449,30 @@ class VSMRFSCILTrainer:
             "joint_accuracy_before_transfer": raw_joint_accuracy,
             "class_average_accuracy_before_transfer": raw_joint_macro,
             "joint_transfer_gain": accuracy - raw_joint_accuracy,
+            "novel_joint_accuracy_before_transfer": novel_joint_before,
+            "novel_joint_accuracy_after_transfer": novel_joint_after,
+            "novel_joint_transfer_gain": (
+                novel_joint_after - novel_joint_before
+                if novel_mask.any() else None
+            ),
             "joint_accuracy_fixed_index": fixed_joint_accuracy,
             "query_ot_joint_gain_over_fixed_index": accuracy - fixed_joint_accuracy,
-            "local_accuracy_after_transfer": float((transferred_local.argmax(1) == labels).float().mean()),
-            "local_accuracy_before_transfer": float((raw_local.argmax(1) == labels).float().mean()),
-            "local_transfer_gain": float(
-                (transferred_local.argmax(1) == labels).float().mean()
-                - (raw_local.argmax(1) == labels).float().mean()
+            "novel_joint_accuracy_fixed_index": novel_fixed,
+            "novel_query_ot_gain_over_fixed_index": (
+                novel_query_ot - novel_fixed if novel_mask.any() else None
             ),
-            "query_ot_local_accuracy": float((transferred_local.argmax(1) == labels).float().mean()),
-            "fixed_index_local_accuracy": float((fixed_local.argmax(1) == labels).float().mean()),
+            "local_accuracy_after_transfer": float(local_after.float().mean()),
+            "local_accuracy_before_transfer": float(local_before.float().mean()),
+            "local_transfer_gain": float(local_after.float().mean() - local_before.float().mean()),
+            "novel_local_accuracy_before_transfer": novel_local_before,
+            "novel_local_accuracy_after_transfer": novel_local_after,
+            "novel_local_transfer_gain": (
+                novel_local_after - novel_local_before if novel_mask.any() else None
+            ),
+            "query_ot_local_accuracy": float(local_after.float().mean()),
+            "fixed_index_local_accuracy": float(local_fixed.float().mean()),
             "query_ot_vs_fixed_index_gain": float(
-                (transferred_local.argmax(1) == labels).float().mean()
-                - (fixed_local.argmax(1) == labels).float().mean()
+                local_after.float().mean() - local_fixed.float().mean()
             ),
             "query_ot_assignment_entropy": float(torch.cat(ot_entropies).mean()),
         }
