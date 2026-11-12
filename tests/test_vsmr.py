@@ -60,8 +60,9 @@ class TestVisualSemanticDecomposition(unittest.TestCase):
     def test_vsmr_integrates_with_repository_vit_and_freeze_contract(self):
         # Use the repository's actual ViT implementation with a small shape;
         # pretrained weights are intentionally disabled in this unit test.
-        encoder = model_My.vit_base_patch16_224_in21k(
-            pretrained=False,
+        encoder = model_My.VisionTransformer(
+            img_size=224,
+            patch_size=16,
             num_classes=0,
             global_pool="token",
             embed_dim=24,
