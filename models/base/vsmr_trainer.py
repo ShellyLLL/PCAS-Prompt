@@ -15,6 +15,11 @@ from dataloader.data_utils import (
     get_base_dataloader, get_new_dataloader, set_up_datasets,
 )
 from .vsmr_modules import VSMRViT
+from .vsmr_episodes import (
+    ROLE_BASE_QUERY, ROLE_NOVEL_SUPPORT, ROLE_NOVEL_QUERY,
+    VSMREpisodeBatchSampler, VSMREpisodeFeatureDataset,
+    split_reference_episode_indices,
+)
 from .vsmr_losses import (
     attention_overlap_loss, component_diversity_loss,
     cross_image_semantic_alignment, global_logits,
@@ -246,93 +251,77 @@ class VSMRFSCILTrainer:
         print("[VSMR] " + json.dumps(record, ensure_ascii=False, sort_keys=True))
 
 
-    def _pseudo_incremental_episode(self, features, parts, patches, labels,
-                                    epsilon, sinkhorn_steps, logit_scale):
-        """Train transfer and reconstruction as a genuine base-to-novel episode.
+    def _pseudo_incremental_episode(
+        self, episode_batch, reference_global, reference_parts,
+        epsilon, sinkhorn_steps, logit_scale,
+    ):
+        """Train transfer/reconstruction with full-class, disjoint FSCIL episodes.
 
-        A subset of batch classes is hidden from the episode's base memory.
-        Their K-shot support prototypes are composed only from the remaining
-        pseudo-base classes; held-out query images are classified against both
-        pseudo-base and pseudo-novel prototypes. No pseudo-novel class can
-        retrieve its own class components.
+        The reference memory is extracted from a per-class image partition
+        disjoint from every episode support/query. Each episode hides a set of
+        pseudo-novel classes from the full base reference memory, composes
+        their exact K-shot supports, and jointly classifies pseudo-base and
+        pseudo-novel queries against the complete candidate class set.
         """
-        classes = torch.unique(labels.long(), sorted=True)
-        if classes.numel() < 2:
-            zero = features.sum() * 0.0
-            return zero, zero, zero
+        cls_features, patch_features, labels, roles = episode_batch
+        cls_features = cls_features.to(self.device, non_blocking=True)
+        patch_features = patch_features.to(self.device, non_blocking=True)
+        labels = labels.to(self.device, non_blocking=True).long()
+        roles = roles.to(self.device, non_blocking=True).long()
 
-        fraction = float(getattr(self.args, "vsmr_episode_novel_fraction", 0.25))
-        if not 0.0 < fraction < 1.0:
-            raise ValueError("vsmr_episode_novel_fraction must be in (0,1).")
-        novel_count = max(1, min(
-            int(classes.numel()) - 1,
-            int(round(int(classes.numel()) * fraction)),
-        ))
-        order = torch.randperm(classes.numel(), device=classes.device)
-        novel_classes = classes[order[:novel_count]]
-        base_classes = classes[order[novel_count:]]
+        support_mask = roles == ROLE_NOVEL_SUPPORT
+        novel_query_mask = roles == ROLE_NOVEL_QUERY
+        base_query_mask = roles == ROLE_BASE_QUERY
+        if not support_mask.any() or not novel_query_mask.any() or not base_query_mask.any():
+            raise RuntimeError("Episode must contain novel supports and both query roles.")
 
-        base_global = []
-        base_parts = []
-        for cls in base_classes:
-            indices = torch.nonzero(labels == cls, as_tuple=False).flatten()
-            base_global.append(F.normalize(features[indices].mean(0), dim=-1))
-            base_parts.append(ot_barycenter(
-                parts[indices], epsilon, sinkhorn_steps,
-                int(getattr(self.args, "vsmr_barycenter_iterations", 5)),
-            ))
-        base_global = torch.stack(base_global)
-        base_parts = torch.stack(base_parts)
+        novel_classes = torch.unique(labels[support_mask], sorted=True)
+        if not torch.equal(
+            torch.unique(labels[novel_query_mask], sorted=True), novel_classes
+        ):
+            raise RuntimeError("Every pseudo-novel class must have support and query samples.")
+        if torch.isin(labels[base_query_mask], novel_classes).any():
+            raise RuntimeError("Pseudo-base query labels overlap pseudo-novel classes.")
+
+        all_base_classes = torch.arange(
+            int(self.args.base_class), device=self.device, dtype=torch.long
+        )
+        keep_base = ~torch.isin(all_base_classes, novel_classes)
+        base_classes = all_base_classes[keep_base]
+        if base_classes.numel() < 1:
+            raise RuntimeError("Episode removed every pseudo-base class.")
+
+        # Reference memory was built from the disjoint reference image split.
+        base_global = reference_global[base_classes]
+        base_parts = reference_parts[base_classes]
         base_bank, base_owner, _ = build_base_component_bank(base_parts)
 
         novel_global = []
         novel_raw_parts = []
         novel_variance = []
-        shots = []
-        query_indices = []
-        query_targets = []
-        max_shot = int(getattr(self.args, "vsmr_episode_max_shot", 3))
-
-        for novel_position, cls in enumerate(novel_classes):
-            indices = torch.nonzero(labels == cls, as_tuple=False).flatten()
-            if indices.numel() < 2:
-                raise RuntimeError("Pseudo-novel classes need support and query images.")
-            shot_limit = min(max_shot, int(indices.numel()) - 1)
-            if shot_limit < 1:
-                raise RuntimeError("vsmr_episode_max_shot must leave a query image.")
-            shuffled = indices[torch.randperm(indices.numel(), device=indices.device)]
-            shot = int(torch.randint(
-                1, shot_limit + 1, (1,), device=indices.device
-            ).item())
-            support_indices = shuffled[:shot]
-            query_for_class = shuffled[shot:]
-
-            support_local = parts[support_indices]
+        for cls in novel_classes:
+            selected = support_mask & labels.eq(cls)
+            support_global = cls_features[selected]
+            support_parts = episode_batch[1][selected.cpu()].to(
+                self.device, non_blocking=True
+            )
+            if support_global.shape[0] != int(getattr(self.args, "vsmr_episode_novel_shot", 5)):
+                raise RuntimeError("Pseudo-novel support count does not match exact K-shot.")
             local_prototype = ot_barycenter(
-                support_local, epsilon, sinkhorn_steps,
+                support_parts, epsilon, sinkhorn_steps,
                 int(getattr(self.args, "vsmr_barycenter_iterations", 5)),
             )
-            novel_global.append(F.normalize(
-                features[support_indices].mean(0), dim=-1
-            ))
+            novel_global.append(F.normalize(support_global.mean(0), dim=-1))
             novel_raw_parts.append(local_prototype)
             novel_variance.append(component_support_variance(
-                support_local, local_prototype, epsilon, sinkhorn_steps
-            ))
-            shots.append(shot)
-            query_indices.append(query_for_class)
-            query_targets.append(torch.full(
-                (query_for_class.numel(),),
-                int(base_classes.numel()) + novel_position,
-                dtype=torch.long,
-                device=labels.device,
+                support_parts, local_prototype, epsilon, sinkhorn_steps
             ))
 
         novel_global = torch.stack(novel_global)
         novel_raw_parts = torch.stack(novel_raw_parts)
         novel_variance = torch.stack(novel_variance)
-        shot_tensor = torch.tensor(shots, dtype=features.dtype, device=features.device)
-        novel_parts, _, _, _, _ = compose_novel_prototypes(
+        shots = int(getattr(self.args, "vsmr_episode_novel_shot", 5))
+        novel_parts, alpha, reliability, selected, transfer_weights = compose_novel_prototypes(
             novel_raw_parts,
             base_bank,
             self.model.reliability_gate,
@@ -341,37 +330,120 @@ class VSMRFSCILTrainer:
             alpha_max=float(getattr(self.args, "vsmr_transfer_alpha_max", 0.5)),
             similarity_temperature=float(getattr(self.args, "vsmr_transfer_temperature", 0.1)),
             support_variance=novel_variance,
-            shots=shot_tensor,
+            shots=shots,
         )
 
+        # Candidate order is all retained base IDs in ascending order,
+        # followed by the sorted pseudo-novel IDs.
         candidate_global = torch.cat([base_global, novel_global], dim=0)
         candidate_parts = torch.cat([base_parts, novel_parts], dim=0)
-        query_indices = torch.cat(query_indices, dim=0)
-        query_targets = torch.cat(query_targets, dim=0)
-        if query_indices.numel() == 0:
-            raise RuntimeError("Pseudo-incremental episode produced no query images.")
+        base_target_map = torch.full(
+            (int(self.args.base_class),), -1, dtype=torch.long, device=self.device
+        )
+        base_target_map[base_classes] = torch.arange(
+            base_classes.numel(), device=self.device
+        )
+        novel_target_map = {
+            int(cls): int(base_classes.numel()) + position
+            for position, cls in enumerate(novel_classes.tolist())
+        }
 
-        query_global = features[query_indices]
-        query_parts = parts[query_indices]
-        query_patches = patches[query_indices]
+        query_mask = base_query_mask | novel_query_mask
+        query_features = cls_features[query_mask]
+        query_parts = episode_batch[1][query_mask.cpu()].to(
+            self.device, non_blocking=True
+        )
+        query_patches = patch_features[query_mask]
+        query_labels = labels[query_mask]
+        targets = []
+        for cls in query_labels.tolist():
+            if cls in novel_target_map:
+                targets.append(novel_target_map[cls])
+            else:
+                target = int(base_target_map[cls].item())
+                if target < 0:
+                    raise RuntimeError("Query class is absent from the candidate memory.")
+                targets.append(target)
+        targets = torch.tensor(targets, dtype=torch.long, device=self.device)
+
         global_scores = global_logits(
-            query_global, candidate_global, logit_scale
+            query_features, candidate_global, logit_scale
         )
         local_scores, _, _, _ = query_conditioned_reconstruction(
-            query_parts,
-            query_patches,
-            candidate_parts,
+            query_parts, query_patches, candidate_parts,
             self.model.reconstructor,
-            epsilon=epsilon,
-            iterations=sinkhorn_steps,
-            scale=logit_scale,
+            epsilon=epsilon, iterations=sinkhorn_steps, scale=logit_scale,
         )
         joint_scores = self.model.fusion(global_scores, local_scores)
+
+        base_query_count = int(base_query_mask.sum().item())
+        novel_query_count = int(novel_query_mask.sum().item())
+        if base_query_count == 0 or novel_query_count == 0:
+            raise RuntimeError("Episode requires both base and novel queries.")
         return (
-            F.cross_entropy(global_scores, query_targets),
-            F.cross_entropy(local_scores, query_targets),
-            F.cross_entropy(joint_scores, query_targets),
+            F.cross_entropy(global_scores, targets),
+            F.cross_entropy(local_scores, targets),
+            F.cross_entropy(joint_scores, targets),
+            {
+                "episode_candidate_classes": int(candidate_global.shape[0]),
+                "episode_base_candidate_classes": int(base_classes.numel()),
+                "episode_novel_classes": int(novel_classes.numel()),
+                "episode_base_queries": base_query_count,
+                "episode_novel_queries": novel_query_count,
+                "episode_support_shots": shots,
+                "episode_transfer_alpha": float(alpha.detach().mean()),
+                "episode_gate_reliability": float(reliability.detach().mean()),
+            },
         )
+
+    @torch.no_grad()
+    def _build_episode_reference(self, trainset, reference_indices, labels):
+        """Recompute full base-class memory from the disjoint reference split."""
+        original = getattr(trainset, "transform", None)
+        if original is None:
+            raise RuntimeError("Episode reference dataset must expose a transform.")
+        trainset.transform = self._transform()
+        subset = torch.utils.data.Subset(trainset, reference_indices.tolist())
+        loader = self._loader(
+            subset, int(getattr(self.args, "vsmr_eval_batch_size", 8))
+        )
+        globals_, parts_, labels_ = [], [], []
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            for images, batch_labels in loader:
+                output = self.model(images.to(self.device, non_blocking=True))
+                globals_.append(output["global_features"])
+                parts_.append(output["parts"])
+                labels_.append(torch.as_tensor(
+                    batch_labels, device=self.device
+                ).long())
+        finally:
+            trainset.transform = original
+            if was_training:
+                self.model.train()
+        features = torch.cat(globals_)
+        parts = torch.cat(parts_)
+        extracted_labels = torch.cat(labels_)
+        prototypes_global = []
+        prototypes_parts = []
+        expected = torch.arange(
+            int(self.args.base_class), device=self.device, dtype=torch.long
+        )
+        if not torch.equal(torch.unique(extracted_labels, sorted=True), expected):
+            raise RuntimeError("Reference split must contain every base class.")
+        for cls in expected:
+            selected = extracted_labels.eq(cls)
+            if not selected.any():
+                raise RuntimeError("Reference memory missing base class {}.".format(int(cls)))
+            prototypes_global.append(F.normalize(features[selected].mean(0), dim=-1))
+            prototypes_parts.append(ot_barycenter(
+                parts[selected],
+                float(getattr(self.args, "vsmr_ot_epsilon", 0.05)),
+                int(getattr(self.args, "vsmr_sinkhorn_iterations", 30)),
+                int(getattr(self.args, "vsmr_barycenter_iterations", 5)),
+            ))
+        return torch.stack(prototypes_global).detach(), torch.stack(prototypes_parts).detach()
 
     def _train_base(self, trainset):
         # Replace legacy dataset transforms before creating the DataLoader:
