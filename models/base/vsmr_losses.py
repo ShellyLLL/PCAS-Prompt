@@ -62,6 +62,68 @@ def sinkhorn_transport(cost, epsilon=0.05, iterations=30):
     return transport
 
 
+def sinkhorn_rectangular_transport(logits, epsilon=1.0, iterations=50):
+    """Balanced transport from K Prompt queries to N Patch tokens.
+
+    Returns a joint transport plan with row marginals 1/K and column
+    marginals 1/N. Unlike independent row-wise softmax, the column constraint
+    makes all Prompt queries compete for the same Patch-token capacity.
+    """
+    if logits.ndim != 3:
+        raise ValueError("Prompt assignment logits must have shape [B,K,N].")
+    if logits.shape[1] < 1 or logits.shape[2] < 1:
+        raise ValueError("Prompt and Patch dimensions must be non-empty.")
+    if not torch.isfinite(logits).all():
+        raise ValueError("Prompt assignment logits contain non-finite values.")
+    if float(epsilon) <= 0 or int(iterations) < 1:
+        raise ValueError("Assignment epsilon and iterations must be positive.")
+
+    batch, prompts, patches = logits.shape
+    log_kernel = logits / float(epsilon)
+    # A per-image additive constant leaves the optimal transport plan unchanged.
+    log_kernel = log_kernel - log_kernel.amax(dim=(-1, -2), keepdim=True)
+    log_a = logits.new_full((batch, prompts), -math.log(prompts))
+    log_b = logits.new_full((batch, patches), -math.log(patches))
+    u = torch.zeros_like(log_a)
+    v = torch.zeros_like(log_b)
+    for _ in range(int(iterations)):
+        u = log_a - torch.logsumexp(log_kernel + v.unsqueeze(-2), dim=-1)
+        v = log_b - torch.logsumexp(log_kernel + u.unsqueeze(-1), dim=-2)
+    transport = torch.exp(
+        log_kernel + u.unsqueeze(-1) + v.unsqueeze(-2)
+    )
+    if not torch.isfinite(transport).all():
+        raise FloatingPointError("Rectangular Sinkhorn produced non-finite transport.")
+    return transport
+
+
+def prompt_orthogonality_loss(prompt_queries):
+    """Prevent shared Prompt queries from collapsing to one direction."""
+    if prompt_queries.ndim != 2 or prompt_queries.shape[0] < 2:
+        raise ValueError("prompt_queries must have shape [K,D], K >= 2.")
+    queries = F.normalize(prompt_queries, dim=-1)
+    gram = queries @ queries.transpose(0, 1)
+    off_diagonal = ~torch.eye(
+        queries.shape[0], dtype=torch.bool, device=queries.device
+    )
+    return gram[off_diagonal].square().mean()
+
+
+def component_diversity_loss(parts, similarity_margin=0.5):
+    """Penalize duplicate output components without forcing full orthogonality."""
+    if parts.ndim != 3 or parts.shape[1] < 2:
+        raise ValueError("parts must have shape [B,K,D], K >= 2.")
+    if not 0.0 <= float(similarity_margin) < 1.0:
+        raise ValueError("similarity_margin must be in [0,1).")
+    normalized = F.normalize(parts, dim=-1)
+    similarity = torch.matmul(normalized, normalized.transpose(1, 2))
+    count = parts.shape[1]
+    off_diagonal = ~torch.eye(
+        count, dtype=torch.bool, device=parts.device
+    )
+    return F.relu(similarity[:, off_diagonal] - float(similarity_margin)).square().mean()
+
+
 def ot_distance(query_parts, prototype_parts, epsilon=0.05, iterations=30):
     """Permutation-invariant entropic transport cost, reduced to [B]."""
     cost = pairwise_component_cost(query_parts, prototype_parts)
