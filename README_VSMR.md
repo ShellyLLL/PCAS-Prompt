@@ -21,9 +21,11 @@ No text encoder, second backbone, expert routing, or incremental parameter expan
 
 ### 1.2 Shared Prompt visual decomposition
 
-A shared set of \`M\` learnable visual queries attends softly to Patch tokens. Each query pools one latent visual component. The components are unordered; Prompt indices are not assigned human semantic labels.
+A shared set of `M` learnable visual queries attends to normalized Patch keys. Query-Patch similarities are converted into a balanced rectangular transport plan with row marginals `1/M` and column marginals `1/N`. The plan makes Prompt queries compete for Patch-token capacity; multiplying each transport row by `M` gives normalized pooling weights for aggregating Patch values.
 
-The decomposer is trained only during the base session. The number of components is configurable through \`--vsmr_num_parts\`.
+Prompt indices remain unordered latent slots and are not assigned human semantic labels. Projected-query orthogonality and a hinge penalty on duplicate output components regularize collapse. Training logs record query/component cosine similarities, assignment marginal errors, and attention entropy. Query vectors are initialized with distinct directions to avoid symmetric initialization.
+
+The decomposer is trained only during the base session. The number of components is configurable through `--vsmr_num_parts`.
 
 ### 1.3 Cross-image component alignment
 
@@ -92,7 +94,8 @@ The base objective is:
 
 \[
 L = L_g + w_l L_l + w_j L_{joint}
-  + w_{OT} L_{OT} + w_{JS} L_{JS} + w_{div} L_{div}.
+  + w_{OT} L_{OT} + w_{JS} L_{JS} + w_{div} L_{div}
+  + w_{prompt} L_{prompt} + w_{component} L_{component}.
 \]
 
 - \`L_g\`: global prototype cross-entropy. It combines base-batch leave-one-out classification with pseudo-incremental query classification.
@@ -142,6 +145,9 @@ python train.py --method vsmr -project base -dataset cub200 -vit \\
 | Setting | Default |
 |---|---:|
 | Shared visual components | 6 |
+| Prompt similarity logit scale / temperature | 10 / 1.0 |
+| Balanced Prompt-Patch Sinkhorn epsilon / iterations | 1.0 / 50 |
+| Prompt orthogonality / component diversity weights | 0.2 / 0.1 |
 | Base batch classes / images per class | 16 / 4 |
 | Pseudo-novel class fraction | 0.25 |
 | Pseudo-incremental maximum shots | 3 |
