@@ -67,17 +67,18 @@ def split_reference_episode_indices(
 class VSMREpisodeFeatureDataset(Dataset):
     """Read-only frozen-backbone feature cache with role-tagged indices."""
 
-    def __init__(self, cls_features, patch_features, labels):
-        if cls_features.ndim != 2 or patch_features.ndim != 3:
-            raise ValueError("Cached CLS/Patch features must be [N,D] and [N,P,D].")
-        if cls_features.shape[0] != patch_features.shape[0]:
-            raise ValueError("Cached CLS and Patch features must share N.")
-        if cls_features.shape[-1] != patch_features.shape[-1]:
-            raise ValueError("Cached CLS and Patch dimensions must match.")
+    def __init__(self, cls_features, part_features, patch_features, labels):
+        if cls_features.ndim != 2 or part_features.ndim != 3 or patch_features.ndim != 3:
+            raise ValueError("Cached CLS/part/Patch features must be [N,D], [N,K,D], [N,P,D].")
+        if not (cls_features.shape[0] == part_features.shape[0] == patch_features.shape[0]):
+            raise ValueError("Cached CLS, part and Patch features must share N.")
+        if not (cls_features.shape[-1] == part_features.shape[-1] == patch_features.shape[-1]):
+            raise ValueError("Cached CLS, part and Patch dimensions must match.")
         labels = torch.as_tensor(labels, dtype=torch.long, device="cpu")
         if labels.ndim != 1 or labels.numel() != cls_features.shape[0]:
             raise ValueError("Cached labels must have one entry per image.")
         self.cls_features = cls_features.detach().cpu().contiguous()
+        self.part_features = part_features.detach().cpu().contiguous()
         self.patch_features = patch_features.detach().cpu().contiguous()
         self.labels = labels.contiguous()
 
@@ -94,6 +95,7 @@ class VSMREpisodeFeatureDataset(Dataset):
             raise ValueError("Unknown VSMR episode sample role: {}".format(role))
         return (
             self.cls_features[index],
+            self.part_features[index],
             self.patch_features[index],
             self.labels[index],
             torch.tensor(role, dtype=torch.long),
