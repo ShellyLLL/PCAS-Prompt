@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models import model_My
+from .vsmr_losses import sinkhorn_rectangular_transport
 
 
 class FrozenViTBackbone(nn.Module):
@@ -108,17 +109,28 @@ class FrozenViTBackbone(nn.Module):
 
 
 class VisualSemanticDecomposer(nn.Module):
-    """Shared soft prompts that pool Patch features into unordered parts."""
+    """Shared Prompt queries with balanced, permutation-free spatial pooling.
 
-    def __init__(self, embed_dim=768, num_parts=6, temperature=1.0):
+    Prompt indices remain latent and have no fixed semantic labels. Each
+    query competes for Patch-token capacity through a balanced transport plan.
+    """
+
+    def __init__(self, embed_dim=768, num_parts=6, temperature=1.0,
+                 logit_scale=10.0, assignment_epsilon=1.0,
+                 sinkhorn_iterations=50):
         super().__init__()
         if int(embed_dim) <= 0 or int(num_parts) < 2:
             raise ValueError("embed_dim must be positive and num_parts >= 2.")
-        if float(temperature) <= 0:
-            raise ValueError("Prompt attention temperature must be positive.")
+        if float(temperature) <= 0 or float(logit_scale) <= 0:
+            raise ValueError("Prompt temperature and logit scale must be positive.")
+        if float(assignment_epsilon) <= 0 or int(sinkhorn_iterations) < 1:
+            raise ValueError("Assignment epsilon and iterations must be positive.")
         self.embed_dim = int(embed_dim)
         self.num_parts = int(num_parts)
         self.temperature = float(temperature)
+        self.logit_scale = float(logit_scale)
+        self.assignment_epsilon = float(assignment_epsilon)
+        self.sinkhorn_iterations = int(sinkhorn_iterations)
 
         self.shared_prompts = nn.Parameter(
             torch.empty(self.num_parts, self.embed_dim)
@@ -138,31 +150,44 @@ class VisualSemanticDecomposer(nn.Module):
             self.embed_dim, self.embed_dim, bias=False
         )
 
-    def forward(self, cls_features, patch_features):
+    def forward(self, cls_features, patch_features, return_aux=False):
         if cls_features.ndim != 2 or patch_features.ndim != 3:
             raise ValueError("Expected CLS [B,D] and Patch [B,N,D] features.")
         batch_size, num_patches, feature_dim = patch_features.shape
+        if num_patches < self.num_parts:
+            raise ValueError("The number of Patch tokens must be >= num_parts.")
         if feature_dim != self.embed_dim:
             raise ValueError("Patch feature dimension does not match VSMR.")
         if cls_features.shape != (batch_size, self.embed_dim):
             raise ValueError("CLS and Patch feature dimensions do not match.")
 
-        queries = self.query_projection(self.shared_prompts)
-        keys = self.key_projection(patch_features)
+        # Normalize query/key directions so attention scale is controlled by
+        # explicit temperature and logit-scale parameters, not vector norms.
+        queries = F.normalize(
+            self.query_projection(self.shared_prompts), p=2, dim=-1
+        )
+        keys = F.normalize(self.key_projection(patch_features), p=2, dim=-1)
         values = self.value_projection(patch_features)
 
         attention_logits = torch.einsum(
             "kd,bnd->bkn", queries, keys
-        ) / (math.sqrt(self.embed_dim) * self.temperature)
-        attention = torch.softmax(attention_logits, dim=-1)
-
+        ) * (self.logit_scale / self.temperature)
+        assignment = sinkhorn_rectangular_transport(
+            attention_logits,
+            epsilon=self.assignment_epsilon,
+            iterations=self.sinkhorn_iterations,
+        )
+        # The transport has row mass 1/K. Rescale each row to sum to one for
+        # weighted feature pooling; its column sums remain K/N.
+        attention = assignment * float(self.num_parts)
         local_parts = torch.bmm(attention, values)
         local_parts = F.normalize(local_parts, p=2, dim=-1)
         global_features = F.normalize(
             self.global_projection(cls_features), p=2, dim=-1
         )
+        if return_aux:
+            return global_features, local_parts, attention, queries, assignment
         return global_features, local_parts, attention
-
 
 class ReliabilityGate(nn.Module):
     """Learned component-wise transfer reliability gate.
@@ -322,6 +347,13 @@ class VSMRViT(nn.Module):
             embed_dim=dim,
             num_parts=int(getattr(args, "vsmr_num_parts", 6)),
             temperature=float(getattr(args, "vsmr_prompt_temperature", 1.0)),
+            logit_scale=float(getattr(args, "vsmr_prompt_logit_scale", 10.0)),
+            assignment_epsilon=float(getattr(
+                args, "vsmr_prompt_assignment_epsilon", 1.0
+            )),
+            sinkhorn_iterations=int(getattr(
+                args, "vsmr_prompt_sinkhorn_iterations", 50
+            )),
         )
         self.reliability_gate = ReliabilityGate(
             embed_dim=dim,
@@ -346,14 +378,16 @@ class VSMRViT(nn.Module):
 
     def forward(self, images):
         cls_features, patch_features = self.backbone(images)
-        global_features, parts, attention = self.decomposer(
-            cls_features, patch_features
+        global_features, parts, attention, prompt_queries, assignment = (
+            self.decomposer(cls_features, patch_features, return_aux=True)
         )
         return {
             "global_features": global_features,
             "parts": parts,
             "attention": attention,
             "patch_features": patch_features,
+            "prompt_queries": prompt_queries,
+            "assignment": assignment,
         }
 
     def freeze_for_incremental(self):
