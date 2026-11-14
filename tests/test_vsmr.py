@@ -473,6 +473,20 @@ class TestDisjointFSCILEpisodes(unittest.TestCase):
             self.assertGreaterEqual((labels[reference] == cls).sum(), 1)
             self.assertGreaterEqual((labels[episode] == cls).sum(), 7)
 
+    def test_feature_dataset_returns_separate_cls_parts_patches_and_role(self):
+        from models.base.vsmr_episodes import VSMREpisodeFeatureDataset
+        cls = torch.randn(8, 12)
+        parts = torch.randn(8, 4, 12)
+        patches = torch.randn(8, 16, 12)
+        labels = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+        dataset = VSMREpisodeFeatureDataset(cls, parts, patches, labels)
+        sample = dataset[(3, ROLE_NOVEL_SUPPORT)]
+        self.assertEqual(sample[0].shape, (12,))
+        self.assertEqual(sample[1].shape, (4, 12))
+        self.assertEqual(sample[2].shape, (16, 12))
+        self.assertEqual(int(sample[3]), 0)
+        self.assertEqual(int(sample[4]), ROLE_NOVEL_SUPPORT)
+
     def test_episode_sampler_enforces_five_shot_and_disjoint_queries(self):
         labels = np.repeat(np.arange(20), 12)
         episode_indices = np.arange(labels.size)
