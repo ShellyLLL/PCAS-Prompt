@@ -54,15 +54,15 @@ The training set is deterministically partitioned per class into a reference poo
 At each base-training epoch, frozen-backbone features are refreshed for the complete base training set using the current decomposer. One reference prototype is built for every base class. Each episode then hides 10 pseudo-novel classes from this complete memory, uses exactly 5 support images per pseudo-novel class, and evaluates independent novel queries together with queries from 16 pseudo-base classes. Candidate classification includes every retained pseudo-base class plus all pseudo-novel classes (100 candidates for CUB-200's 100-base-class protocol). This replaces the earlier within-minibatch episode, which had only a small and variable candidate bank.
 
 
-The base-stage trainer constructs pseudo-incremental episodes from each class-balanced batch:
+The episode sampler is dataset-backed rather than restricted to the current class-balanced minibatch:
 
-1. Randomly reserve a subset of batch classes as pseudo-novel classes.
-2. Build a temporary source bank only from the remaining pseudo-base classes.
-3. Sample K-shot support examples and disjoint query examples for each pseudo-novel class.
-4. Build raw novel prototypes and OT-aligned support-dispersion statistics.
-5. Retrieve at most one component from each source base class for every novel component.
+1. Deterministically partition each base class into disjoint reference and episode image pools.
+2. Build one reference global/local prototype for every base class from the reference pool.
+3. Hide the selected pseudo-novel classes from that complete reference memory.
+4. Build exact 5-shot pseudo-novel global/local prototypes and OT-aligned support-dispersion statistics.
+5. Retrieve at most one component from each retained pseudo-base source class for every novel component.
 6. Use a trainable ReliabilityGate MLP to estimate component-wise transfer reliability.
-7. Classify pseudo-novel queries against both pseudo-base and recomposed pseudo-novel prototypes.
+7. Classify both pseudo-base queries and independent pseudo-novel queries against all retained base classes plus all pseudo-novel classes.
 
 The gate receives the novel component, retrieved component, their product and absolute difference, retrieval similarity, top-source margin, normalized retrieval entropy, support dispersion, and log shot count. Its output is learned from pseudo-incremental global/local/joint classification losses. It is not a fixed similarity heuristic.
 
