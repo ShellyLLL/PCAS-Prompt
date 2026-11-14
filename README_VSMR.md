@@ -1,31 +1,137 @@
-# VSMR for Few-Shot Class-Incremental Learning
+# VSMR: Unified Visual-Semantic Decomposition and Prototype Recomposition for FSCIL
 
-The default method on \`dev\` is **VSMR (Visual Semantic Decomposition and Prototype Reconstruction)**. It implements the agreed visual-only FSCIL architecture with a frozen ImageNet-21K ViT-B/16.
+The default method on \`dev\` is VSMR. The unified implementation is developed from \`dev\` and keeps the pretrained ImageNet-21K ViT-B/16 frozen in every session.
 
-## Architecture
+## 0. Frozen-backbone preprocessing contract
 
-1. **Frozen ViT-B/16:** one frozen visual backbone returns CLS and final Patch features. No text encoder, second backbone, expert routing, or incremental parameter expansion is used.
-2. **Shared soft-prompt decomposition:** a fixed set of learnable visual prompts attends continuously to Patch features using softmax. Each prompt pools one latent local component. Prompt indices are not treated as semantic labels.
-3. **Cross-image component matching:** entropic optimal transport (OT) with uniform marginals establishes permutation-invariant correspondences between unordered component sets.
-4. **Unified base training:** leave-one-out global prototype classification, leave-one-out local OT classification, same-class cross-image OT alignment, symmetric global/local cross-image semantic alignment (JS), and attention-overlap regularization are optimized jointly.
-5. **Base knowledge memory:** each base class stores a global mean prototype and an OT component-set barycenter. The flattened base component bank is immutable.
-6. **Novel prototype composition:** each novel component independently retrieves top-r base components. Softmax retrieval weights, mean similarity, and source dispersion determine a bounded reliability gate. No whole base-class prototype is transferred.
-7. **Query-conditioned reconstruction:** a query-to-class component OT plan supplies only the assignment weights. Reconstructed component values are weighted combinations of the candidate class's stored components; query values never enter prototype content.
-8. **Unified classifier:** global cosine similarity and query-conditioned local OT reconstruction scores classify all seen classes. Incremental sessions append prototypes only; the backbone, prompts, and old memories remain frozen.
+VSMR reads the mean, standard deviation, interpolation mode, and crop percentage from the instantiated pretrained ViT checkpoint configuration. Base-session training retains random resized-crop and horizontal-flip augmentation, but uses the checkpoint's interpolation and normalization. Base-memory extraction, incremental support extraction, and evaluation use the corresponding deterministic resize/center-crop transform with the same checkpoint statistics. Dataset-specific CIFAR/ImageNet normalization is never substituted for the checkpoint's input statistics.
 
-## Objective
+For the repository's ImageNet-21K ViT-B/16 configuration, the input mean/std and resize/crop policy follow that checkpoint's timm metadata. If a checkpoint does not expose valid RGB statistics, VSMR uses the explicit fallback mean/std of 0.5/0.5 and validates the resulting transform.
 
-\`L = L_global + w_local L_local + w_align L_OT + w_CISA L_JS + w_overlap L_overlap\`
+## 1. Architecture and information flow
 
-- \`L_global\`: cross-entropy over leave-one-out global class prototypes.
-- \`L_local\`: cross-entropy over leave-one-out local OT distances.
-- \`L_OT\`: mean OT distance between distinct images of the same class.
-- \`L_JS\`: symmetric Jensen-Shannon alignment of global/local predictive distributions for distinct same-class images.
-- \`L_overlap\`: overlap penalty between different prompt-to-Patch attention distributions.
+### 1.1 Frozen visual backbone
 
-The ViT backbone is frozen. Only the shared decomposition prompts and their feature projections are optimized.
+A frozen ViT-B/16 produces normalized CLS and final Patch tokens:
 
-## Run CUB-200
+- Global feature: \`g(x) in R^768\` from CLS and a trainable base-stage projection.
+- Patch features: \`X(x) in R^(196 x 768)\` from the final 196 spatial tokens.
+
+No text encoder, second backbone, expert routing, or incremental parameter expansion is used.
+
+### 1.2 Shared Prompt visual decomposition
+
+A shared set of `M` learnable visual queries attends to normalized Patch keys. Query-Patch similarities are converted into a balanced rectangular transport plan with row marginals `1/M` and column marginals `1/N`. The plan makes Prompt queries compete for Patch-token capacity; multiplying each transport row by `M` gives normalized pooling weights for aggregating Patch values.
+
+Prompt indices remain unordered latent slots and are not assigned human semantic labels. Projected-query orthogonality and a hinge penalty on duplicate output components regularize collapse. Training logs record query/component cosine similarities, assignment marginal errors, and attention entropy. Query vectors are initialized with distinct directions to avoid symmetric initialization.
+
+The decomposer is trained only during the base session. The number of components is configurable through `--vsmr_num_parts`.
+
+### 1.3 Cross-image component alignment
+
+Entropic balanced OT with uniform marginals and log-domain Sinkhorn establishes permutation-invariant correspondences between component sets. OT is used for:
+
+- same-class cross-image alignment;
+- class prototype barycenters;
+- leave-one-out local classification;
+- query-to-reconstructed-class matching.
+
+All uses share the same cosine cost and Sinkhorn implementation.
+
+### 1.4 Base knowledge memory
+
+After base training, every base class stores:
+
+- one normalized global mean prototype;
+- one local OT barycenter containing \`M\` visual components.
+
+The flattened base component bank stores source-class ownership and component indices. The bank is immutable after the base session.
+
+### 1.5 Pseudo-incremental training and learned transfer gate
+
+The training set is deterministically partitioned per class into a reference pool (default 70%) and a disjoint episode pool (default 30%). The split is exhaustive and path/index based; no image used to build the pseudo-base reference prototypes is eligible to be a support or query image in an episode.
+
+At each base-training epoch, frozen-backbone features are refreshed for the complete base training set using the current decomposer. One reference prototype is built for every base class. Each episode then hides 10 pseudo-novel classes from this complete memory, uses exactly 5 support images per pseudo-novel class, and evaluates independent novel queries together with queries from 16 pseudo-base classes. Candidate classification includes every retained pseudo-base class plus all pseudo-novel classes (100 candidates for CUB-200's 100-base-class protocol). This replaces the earlier within-minibatch episode, which had only a small and variable candidate bank.
+
+
+The episode sampler is dataset-backed rather than restricted to the current class-balanced minibatch:
+
+1. Deterministically partition each base class into disjoint reference and episode image pools.
+2. Build one reference global/local prototype for every base class from the reference pool.
+3. Hide the selected pseudo-novel classes from that complete reference memory.
+4. Build exact 5-shot pseudo-novel global/local prototypes and OT-aligned support-dispersion statistics.
+5. Retrieve at most one component from each retained pseudo-base source class for every novel component.
+6. Use a trainable ReliabilityGate MLP to estimate component-wise transfer reliability.
+7. Classify both pseudo-base queries and independent pseudo-novel queries against all retained base classes plus all pseudo-novel classes.
+
+The gate receives the novel component, retrieved component, their product and absolute difference, retrieval similarity, top-source margin, normalized retrieval entropy, support dispersion, and log shot count. Its output is learned from pseudo-incremental global/local/joint classification losses. It is not a fixed similarity heuristic.
+
+Top-r retrieval is source-class balanced: multiple highly similar components from the same base class cannot occupy several Top-r positions for one novel component.
+
+### 1.6 Query-conditioned Q/K/V reconstruction
+
+For each query and candidate class:
+
+- stored class components are projected to reconstruction queries;
+- the query's Patch tokens are projected to keys and values;
+- cross-attention produces query-conditioned context;
+- a residual connection and LayerNorm produce temporary reconstructed class components;
+- balanced OT matches the query's decomposed components to the reconstructed components.
+
+The query changes only the temporary representation used for its own score. It never changes or writes to persistent class memory.
+
+### 1.7 Unified classifier
+
+The final score uses a learned convex fusion:
+
+`score = alpha * global_score + (1 - alpha) * local_score`
+
+The scalar `alpha = sigmoid(a)` is trained by the explicit joint classification objective during the base session. Its initial value is set by `--vsmr_global_weight` and `--vsmr_local_weight_eval`; it is frozen before the first incremental session.
+
+- Global score: cosine similarity between the query CLS feature and class global prototype.
+- Local score: negative OT distance between query components and query-conditioned reconstructed class components.
+
+All seen classes use the same scoring rule. No task ID is required.
+
+## 2. Base-stage objective
+
+The base objective is:
+
+\[
+L = L_g + w_l L_l + w_j L_{joint}
+  + w_{OT} L_{OT} + w_{JS} L_{JS} + w_{div} L_{div}
+  + w_{prompt} L_{prompt} + w_{component} L_{component}.
+\]
+
+- \`L_g\`: global prototype cross-entropy. It combines base-batch leave-one-out classification with pseudo-incremental query classification.
+- \`L_l\`: local Q/K/V reconstruction + OT classification. It combines leave-one-out base-batch classification with pseudo-incremental query classification.
+- \`L_joint\`: explicit cross-entropy on the fused global/local scores, including pseudo-incremental queries.
+- \`L_OT\`: mean balanced-OT distance between distinct same-class images.
+- \`L_JS\`: symmetric Jensen-Shannon alignment between global and local predictive distributions for distinct same-class images.
+- \`L_div\`: overlap penalty between different Prompt-to-Patch attention distributions.
+
+The frozen ViT receives no gradients. The shared decomposer, ReliabilityGate, QueryConditionedReconstructor, and global/local fusion coefficient are optimized in the base session. All learned modules are frozen before incremental learning.
+
+## 3. Incremental update protocol
+
+For each novel class:
+
+1. Extract its K-shot global features, Patch tokens, and visual components using the frozen model.
+2. Build the raw global mean prototype and local OT barycenter.
+3. OT-align support components to the novel barycenter to estimate per-component support dispersion.
+4. Retrieve source-class-balanced Top-r base components from the immutable base bank.
+5. Apply the learned frozen ReliabilityGate and compose each novel component with its retrieved base knowledge.
+6. Append the novel global and recomposed local prototypes.
+
+The update is append-only:
+
+- ViT, decomposer, gate, reconstructor, and global/local fusion coefficient remain frozen.
+- Base global/local memories never change.
+- Historical novel prototypes never change.
+- The base component bank remains the only transfer source.
+- Query inference never updates persistent memory.
+
+## 4. Run CUB-200
 
 \`\`\`bash
 export FSCIL_DATA_ROOT=/data/lx/fscil/data
@@ -33,40 +139,57 @@ export FSCIL_INDEX_LIST_ROOT="$FSCIL_DATA_ROOT/index_list"
 
 python train.py --method vsmr -project base -dataset cub200 -vit \\
   -dataroot "$FSCIL_DATA_ROOT" --index_list_root "$FSCIL_INDEX_LIST_ROOT" \\
-  -gpu 0 -seed 1 -epochs_base 50 -num_workers 4 -test_batch_size 64
+  -gpu 0 -seed 1 -epochs_base 50 -num_workers 4 -test_batch_size 64 \\
+  --vsmr_num_parts 6 --vsmr_classes_per_batch 16 \\
+  --vsmr_samples_per_class 4 --vsmr_episode_novel_fraction 0.25 \\
+  --vsmr_episode_max_shot 3 --vsmr_joint_weight 1.0
 \`\`\`
 
-## Key settings
+## 5. Main configuration
 
 | Setting | Default |
 |---|---:|
 | Shared visual components | 6 |
+| Prompt similarity logit scale / temperature | 10 / 1.0 |
+| Balanced Prompt-Patch Sinkhorn epsilon / iterations | 1.0 / 50 |
+| Prompt orthogonality / component diversity weights | 0.2 / 0.1 |
 | Base batch classes / images per class | 16 / 4 |
+| Pseudo-novel class fraction | 0.25 |
+| Pseudo-incremental maximum shots | 3 |
+| Gate hidden dimension | 384 |
 | Prompt/projection learning rate | 2e-4 |
 | OT entropy epsilon / Sinkhorn iterations | 0.05 / 30 |
 | OT barycenter iterations | 5 |
-| Base component retrieval top-r | 5 |
+| Base component retrieval Top-r | 5 source classes |
 | Maximum transfer strength | 0.5 |
-| Global/local inference weights | 0.5 / 0.5 |
+| Initial global/local fusion weights | 0.5 / 0.5 (learned in base session) |
 | Evaluation batch size | 8 |
 
-These are reproducible starting settings, not optimality claims. Tune only on a base-class validation split.
+These are reproducible starting settings, not optimality claims. Hyperparameters must be selected using a base-class validation protocol, not the final incremental test labels.
 
-## Diagnostics and acceptance
+## 6. Diagnostics and acceptance
 
 Each run writes \`metrics.jsonl\`, \`vsmr_base.pth\`, and \`vsmr_final.pth\` under \`checkpoint/<out>/<dataset>/VSMR/<timestamp>/\`.
 
-The log includes per-epoch total/global/local/alignment/CISA/overlap losses, global/local/joint batch accuracy, mean same-class OT distance, learning rate, and per-session sample/macro accuracy, base/novel accuracy, novel-to-base error, transfer reliability/strength, and AA/PD.
+Logs include:
 
-Two critical test-set diagnostics are reported without using test labels for model updates:
-- \`local_transfer_gain\`: local classification accuracy with transferred novel component prototypes minus accuracy with raw novel prototypes.
-- \`query_ot_vs_fixed_index_gain\`: query-conditioned OT local accuracy minus fixed component-index local accuracy.
+- base global/local/joint losses and pseudo-incremental losses;
+- OT, JS, and Prompt-overlap losses;
+- per-session sample and class-average accuracy;
+- base and novel accuracy;
+- novel-to-base error;
+- learned transfer alpha/reliability and source-class/component IDs;
+- transfer gain over raw novel prototypes;
+- Q/K/V + OT gain over fixed-index matching. The fixed-index ablation uses the exact same query-conditioned Q/K/V reconstruction and changes only the final matching rule, so the comparison isolates OT alignment rather than removing reconstruction;
+- Average Accuracy (AA) and Performance Drop (PD).
 
-These are evaluation diagnostics, not training signals or hyperparameter-selection criteria. The test labels are used only to calculate metrics. A positive gain is not guaranteed; results must be reported across the prescribed datasets and multiple seeds.
+The controlled diagnostics use test labels only to calculate metrics. They are not used for gradient updates or hyperparameter selection. A positive transfer or reconstruction gain is not guaranteed and must be reported across datasets and random seeds.
 
-## Tests
+## 7. Tests
 
 \`\`\`bash
 python -m py_compile train.py models/base/vsmr_modules.py models/base/vsmr_losses.py models/base/vsmr_resynthesis.py models/base/vsmr_trainer.py
 python -m unittest discover -s tests -p 'test_vsmr.py' -v
 \`\`\`
+
+The VSMR tests cover frozen-backbone and incremental-freeze contracts, soft Prompt gradients, balanced OT marginals and permutation invariance, OT barycenters, leave-one-out classification, source-class-balanced retrieval, learned gate gradients, support dispersion, query Patch-conditioned Q/K/V reconstruction, append-only memory, and pseudo-incremental gate/reconstructor training.
