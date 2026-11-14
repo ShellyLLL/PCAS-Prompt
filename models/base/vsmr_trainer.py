@@ -599,11 +599,27 @@ class VSMRFSCILTrainer:
         self.all_global = self.base_global.clone()
         self.all_parts = self.base_parts.clone()
         self.all_raw_parts = self.base_parts.clone()
+        normalized_parts = F.normalize(self.base_parts, dim=-1)
+        component_gram = torch.matmul(
+            normalized_parts, normalized_parts.transpose(1, 2)
+        )
+        component_mask = ~torch.eye(
+            component_gram.shape[1], dtype=torch.bool,
+            device=component_gram.device
+        )
+        within_class_similarity = component_gram[:, component_mask]
         self._append_log({
             "stage": "base_memory",
             "base_classes": int(self.base_global.shape[0]),
             "parts_per_class": int(self.base_parts.shape[1]),
             "component_bank_size": int(self.base_bank.shape[0]),
+            "within_class_component_cosine_mean": float(
+                within_class_similarity.mean()
+            ),
+            "within_class_component_cosine_max": float(
+                within_class_similarity.max()
+            ),
+            "component_bank_finite": bool(torch.isfinite(self.base_bank).all()),
         })
 
     @torch.no_grad()
