@@ -16,8 +16,9 @@ from dataloader.data_utils import (
 )
 from .vsmr_modules import VSMRViT
 from .vsmr_losses import (
-    attention_overlap_loss, cross_image_semantic_alignment,
-    global_logits, leave_one_out_global, ot_barycenter,
+    attention_overlap_loss, component_diversity_loss,
+    cross_image_semantic_alignment, global_logits,
+    leave_one_out_global, ot_barycenter, prompt_orthogonality_loss,
 )
 from .vsmr_resynthesis import (
     build_base_component_bank,
@@ -411,6 +412,10 @@ class VSMRFSCILTrainer:
         w_align = float(getattr(self.args, "vsmr_alignment_weight", 0.2))
         w_cisa = float(getattr(self.args, "vsmr_cisa_weight", 0.1))
         w_overlap = float(getattr(self.args, "vsmr_overlap_weight", 0.01))
+        w_prompt_orth = float(getattr(self.args, "vsmr_prompt_orth_weight", 0.2))
+        w_component_div = float(getattr(
+            self.args, "vsmr_component_diversity_weight", 0.1
+        ))
         scale = float(getattr(self.args, "vsmr_logit_scale", 16.0))
 
         for epoch in range(epochs):
@@ -418,6 +423,10 @@ class VSMRFSCILTrainer:
             self.model.train()
             totals = {k: 0.0 for k in (
                 "total", "global", "local", "joint", "alignment", "cisa", "overlap",
+                "prompt_orth", "component_diversity",
+                "query_cosine_mean", "query_cosine_max",
+                "part_cosine_mean", "part_cosine_max",
+                "assignment_row_error", "assignment_col_error", "attention_entropy",
                 "episode_global", "episode_local", "episode_joint",
                 "global_acc", "local_acc", "joint_acc", "ot_same"
             )}
@@ -428,9 +437,10 @@ class VSMRFSCILTrainer:
                 images = images.to(self.device, non_blocking=True)
                 labels_batch = torch.as_tensor(batch_labels, device=self.device).long()
                 output = self.model(images)
-                features, parts, attention, patch_features = (
+                features, parts, attention, patch_features, prompt_queries, assignment = (
                     output["global_features"], output["parts"],
-                    output["attention"], output["patch_features"]
+                    output["attention"], output["patch_features"],
+                    output["prompt_queries"], output["assignment"],
                 )
                 loo_global, inverse, classes = leave_one_out_global(features, labels_batch)
                 # Other-class prototypes are batch means; own-class column is
@@ -482,10 +492,14 @@ class VSMRFSCILTrainer:
                     g_logits, l_logits, labels_batch
                 )
                 overlap_loss = attention_overlap_loss(attention)
+                prompt_orth_loss = prompt_orthogonality_loss(prompt_queries)
+                component_div_loss = component_diversity_loss(parts)
                 total = (
                     global_loss + w_local * local_loss + w_joint * joint_loss
                     + w_align * align_loss + w_cisa * cisa_loss
                     + w_overlap * overlap_loss
+                    + w_prompt_orth * prompt_orth_loss
+                    + w_component_div * component_div_loss
                 )
                 if not torch.isfinite(total):
                     raise FloatingPointError("Non-finite VSMR loss.")
@@ -508,6 +522,35 @@ class VSMRFSCILTrainer:
                     totals["alignment"] += float(align_loss)
                     totals["cisa"] += float(cisa_loss)
                     totals["overlap"] += float(overlap_loss)
+                    totals["prompt_orth"] += float(prompt_orth_loss)
+                    totals["component_diversity"] += float(component_div_loss)
+                    query_gram = F.normalize(prompt_queries, dim=-1) @ F.normalize(
+                        prompt_queries, dim=-1
+                    ).transpose(0, 1)
+                    query_mask = ~torch.eye(
+                        query_gram.shape[0], dtype=torch.bool, device=query_gram.device
+                    )
+                    part_norm = F.normalize(parts, dim=-1)
+                    part_gram = torch.matmul(part_norm, part_norm.transpose(1, 2))
+                    part_mask = ~torch.eye(
+                        part_gram.shape[1], dtype=torch.bool, device=part_gram.device
+                    )
+                    totals["query_cosine_mean"] += float(query_gram[query_mask].mean())
+                    totals["query_cosine_max"] += float(query_gram[query_mask].max())
+                    totals["part_cosine_mean"] += float(part_gram[:, part_mask].mean())
+                    totals["part_cosine_max"] += float(part_gram[:, part_mask].max())
+                    expected_row = 1.0 / float(assignment.shape[1])
+                    expected_col = 1.0 / float(assignment.shape[2])
+                    totals["assignment_row_error"] += float(
+                        (assignment.sum(-1) - expected_row).abs().max()
+                    )
+                    totals["assignment_col_error"] += float(
+                        (assignment.sum(-2) - expected_col).abs().max()
+                    )
+                    totals["attention_entropy"] += float(
+                        -(attention.clamp_min(1e-8)
+                          * attention.clamp_min(1e-8).log()).sum(-1).mean()
+                    )
                     totals["global_acc"] += float((g_logits.argmax(1) == inverse).float().mean())
                     totals["local_acc"] += float((l_logits.argmax(1) == inverse).float().mean())
                     totals["joint_acc"] += float((base_joint_logits.argmax(1) == inverse).float().mean())
