@@ -49,6 +49,11 @@ The flattened base component bank stores source-class ownership and component in
 
 ### 1.5 Pseudo-incremental training and learned transfer gate
 
+The training set is deterministically partitioned per class into a reference pool (default 70%) and a disjoint episode pool (default 30%). The split is exhaustive and path/index based; no image used to build the pseudo-base reference prototypes is eligible to be a support or query image in an episode.
+
+At each base-training epoch, frozen-backbone features are refreshed for the complete base training set using the current decomposer. One reference prototype is built for every base class. Each episode then hides 10 pseudo-novel classes from this complete memory, uses exactly 5 support images per pseudo-novel class, and evaluates independent novel queries together with queries from 16 pseudo-base classes. Candidate classification includes every retained pseudo-base class plus all pseudo-novel classes (100 candidates for CUB-200's 100-base-class protocol). This replaces the earlier within-minibatch episode, which had only a small and variable candidate bank.
+
+
 The base-stage trainer constructs pseudo-incremental episodes from each class-balanced batch:
 
 1. Randomly reserve a subset of batch classes as pseudo-novel classes.
