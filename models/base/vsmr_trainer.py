@@ -397,17 +397,18 @@ class VSMRFSCILTrainer:
         )
 
     @torch.no_grad()
-    def _build_episode_reference(self, trainset, reference_indices, labels):
-        """Recompute full base-class memory from the disjoint reference split."""
+    def _build_episode_reference(
+        self, trainset, reference_indices, episode_indices,
+    ):
+        """Recompute full base-class features and create disjoint episode cache."""
         original = getattr(trainset, "transform", None)
         if original is None:
             raise RuntimeError("Episode reference dataset must expose a transform.")
         trainset.transform = self._transform()
-        subset = torch.utils.data.Subset(trainset, reference_indices.tolist())
         loader = self._loader(
-            subset, int(getattr(self.args, "vsmr_eval_batch_size", 8))
+            trainset, int(getattr(self.args, "vsmr_eval_batch_size", 8))
         )
-        globals_, parts_, labels_ = [], [], []
+        globals_, parts_, patches_, labels_ = [], [], [], []
         was_training = self.model.training
         self.model.eval()
         try:
@@ -415,6 +416,7 @@ class VSMRFSCILTrainer:
                 output = self.model(images.to(self.device, non_blocking=True))
                 globals_.append(output["global_features"])
                 parts_.append(output["parts"])
+                patches_.append(output["patch_features"])
                 labels_.append(torch.as_tensor(
                     batch_labels, device=self.device
                 ).long())
@@ -422,28 +424,54 @@ class VSMRFSCILTrainer:
             trainset.transform = original
             if was_training:
                 self.model.train()
+
         features = torch.cat(globals_)
         parts = torch.cat(parts_)
+        patches = torch.cat(patches_)
         extracted_labels = torch.cat(labels_)
-        prototypes_global = []
-        prototypes_parts = []
         expected = torch.arange(
             int(self.args.base_class), device=self.device, dtype=torch.long
         )
         if not torch.equal(torch.unique(extracted_labels, sorted=True), expected):
-            raise RuntimeError("Reference split must contain every base class.")
+            raise RuntimeError("Episode feature cache must contain every base class.")
+        reference_global = []
+        reference_parts = []
+        reference_labels = extracted_labels[
+            torch.as_tensor(reference_indices, device=self.device, dtype=torch.long)
+        ]
+        reference_features = features[
+            torch.as_tensor(reference_indices, device=self.device, dtype=torch.long)
+        ]
+        reference_components = parts[
+            torch.as_tensor(reference_indices, device=self.device, dtype=torch.long)
+        ]
         for cls in expected:
-            selected = extracted_labels.eq(cls)
+            selected = reference_labels.eq(cls)
             if not selected.any():
                 raise RuntimeError("Reference memory missing base class {}.".format(int(cls)))
-            prototypes_global.append(F.normalize(features[selected].mean(0), dim=-1))
-            prototypes_parts.append(ot_barycenter(
-                parts[selected],
+            reference_global.append(F.normalize(
+                reference_features[selected].mean(0), dim=-1
+            ))
+            reference_parts.append(ot_barycenter(
+                reference_components[selected],
                 float(getattr(self.args, "vsmr_ot_epsilon", 0.05)),
                 int(getattr(self.args, "vsmr_sinkhorn_iterations", 30)),
                 int(getattr(self.args, "vsmr_barycenter_iterations", 5)),
             ))
-        return torch.stack(prototypes_global).detach(), torch.stack(prototypes_parts).detach()
+
+        episode_indices_tensor = torch.as_tensor(
+            episode_indices, device=self.device, dtype=torch.long
+        )
+        episode_dataset = VSMREpisodeFeatureDataset(
+            features[episode_indices_tensor],
+            patches[episode_indices_tensor],
+            extracted_labels[episode_indices_tensor],
+        )
+        return (
+            torch.stack(reference_global).detach(),
+            torch.stack(reference_parts).detach(),
+            episode_dataset,
+        )
 
     def _train_base(self, trainset):
         # Replace legacy dataset transforms before creating the DataLoader:
