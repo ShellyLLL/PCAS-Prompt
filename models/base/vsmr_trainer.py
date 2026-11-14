@@ -411,12 +411,13 @@ class VSMRFSCILTrainer:
         try:
             for images, batch_labels in loader:
                 output = self.model(images.to(self.device, non_blocking=True))
-                globals_.append(output["global_features"])
-                parts_.append(output["parts"])
-                patches_.append(output["patch_features"])
-                labels_.append(torch.as_tensor(
-                    batch_labels, device=self.device
-                ).long())
+                # Keep the full-set feature cache on CPU. CUB base training
+                # stores several thousand 196x768 Patch tensors; retaining all
+                # of them on GPU would needlessly consume multiple GB.
+                globals_.append(output["global_features"].cpu())
+                parts_.append(output["parts"].cpu())
+                patches_.append(output["patch_features"].cpu())
+                labels_.append(torch.as_tensor(batch_labels).long())
         finally:
             trainset.transform = original
             if was_training:
@@ -426,39 +427,29 @@ class VSMRFSCILTrainer:
         parts = torch.cat(parts_)
         patches = torch.cat(patches_)
         extracted_labels = torch.cat(labels_)
-        expected = torch.arange(
-            int(self.args.base_class), device=self.device, dtype=torch.long
-        )
+        expected = torch.arange(int(self.args.base_class), dtype=torch.long)
         if not torch.equal(torch.unique(extracted_labels, sorted=True), expected):
             raise RuntimeError("Episode feature cache must contain every base class.")
         reference_global = []
         reference_parts = []
-        reference_labels = extracted_labels[
-            torch.as_tensor(reference_indices, device=self.device, dtype=torch.long)
-        ]
-        reference_features = features[
-            torch.as_tensor(reference_indices, device=self.device, dtype=torch.long)
-        ]
-        reference_components = parts[
-            torch.as_tensor(reference_indices, device=self.device, dtype=torch.long)
-        ]
+        reference_labels = extracted_labels[torch.as_tensor(reference_indices, dtype=torch.long)]
+        reference_features = features[torch.as_tensor(reference_indices, dtype=torch.long)]
+        reference_components = parts[torch.as_tensor(reference_indices, dtype=torch.long)]
         for cls in expected:
             selected = reference_labels.eq(cls)
             if not selected.any():
                 raise RuntimeError("Reference memory missing base class {}.".format(int(cls)))
-            reference_global.append(F.normalize(
-                reference_features[selected].mean(0), dim=-1
-            ))
+            class_features = reference_features[selected].to(self.device, non_blocking=True)
+            class_components = reference_components[selected].to(self.device, non_blocking=True)
+            reference_global.append(F.normalize(class_features.mean(0), dim=-1))
             reference_parts.append(ot_barycenter(
-                reference_components[selected],
+                class_components,
                 float(getattr(self.args, "vsmr_ot_epsilon", 0.05)),
                 int(getattr(self.args, "vsmr_sinkhorn_iterations", 30)),
                 int(getattr(self.args, "vsmr_barycenter_iterations", 5)),
             ))
 
-        episode_indices_tensor = torch.as_tensor(
-            episode_indices, device=self.device, dtype=torch.long
-        )
+        episode_indices_tensor = torch.as_tensor(episode_indices, dtype=torch.long)
         episode_dataset = VSMREpisodeFeatureDataset(
             features[episode_indices_tensor],
             parts[episode_indices_tensor],
