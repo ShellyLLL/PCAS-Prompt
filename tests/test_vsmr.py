@@ -39,6 +39,10 @@ from models.base.vsmr_modules import (
 from models import model_My
 from models.base.vsmr_modules import VisualSemanticDecomposer, VSMRViT
 from models.base.vsmr_trainer import ClassBalancedBatchSampler, VSMRFSCILTrainer
+from models.base.vsmr_episodes import (
+    ROLE_BASE_QUERY, ROLE_NOVEL_SUPPORT, ROLE_NOVEL_QUERY,
+    VSMREpisodeBatchSampler, split_reference_episode_indices,
+)
 
 
 class TestFixedIndexMatching(unittest.TestCase):
@@ -392,11 +396,12 @@ class TestPrototypeAndTransfer(unittest.TestCase):
         self.assertIsNotNone(patches.grad)
         self.assertIsNotNone(reconstructor.query_projection.weight.grad)
 
-    def test_pseudo_incremental_episode_trains_gate_and_reconstructor(self):
+    def test_pseudo_incremental_episode_uses_full_base_memory_and_exact_five_shot(self):
         trainer = VSMRFSCILTrainer.__new__(VSMRFSCILTrainer)
+        trainer.device = torch.device("cpu")
         trainer.args = SimpleNamespace(
-            vsmr_episode_novel_fraction=0.34,
-            vsmr_episode_max_shot=2,
+            base_class=4,
+            vsmr_episode_novel_shot=5,
             vsmr_barycenter_iterations=2,
             vsmr_transfer_top_r=2,
             vsmr_transfer_alpha_max=0.5,
@@ -412,15 +417,38 @@ class TestPrototypeAndTransfer(unittest.TestCase):
             fusion=GlobalLocalFusion(),
         )
         torch.manual_seed(31)
-        features = F.normalize(torch.randn(12, 8), dim=-1).requires_grad_()
-        parts = F.normalize(torch.randn(12, 4, 8), dim=-1).requires_grad_()
-        patches = F.normalize(torch.randn(12, 10, 8), dim=-1).requires_grad_()
-        labels = torch.tensor([0] * 3 + [1] * 3 + [2] * 3 + [3] * 3)
-        global_loss, local_loss, joint_loss = trainer._pseudo_incremental_episode(
-            features, parts, patches, labels, 0.08, 30, 16.0
+        reference_global = F.normalize(torch.randn(4, 8), dim=-1)
+        reference_parts = F.normalize(torch.randn(4, 4, 8), dim=-1)
+
+        # One pseudo-novel class (class 3): five support, two novel queries.
+        # Two retained pseudo-base classes contribute two independent queries
+        # each; class 2 remains in the full candidate memory without a query.
+        cls_features = F.normalize(torch.randn(9, 8), dim=-1)
+        part_features = F.normalize(torch.randn(9, 4, 8), dim=-1)
+        patch_features = F.normalize(torch.randn(9, 10, 8), dim=-1)
+        labels = torch.tensor([3] * 7 + [0, 1])
+        roles = torch.tensor(
+            [ROLE_NOVEL_SUPPORT] * 5
+            + [ROLE_NOVEL_QUERY] * 2
+            + [ROLE_BASE_QUERY] * 2
+        )
+        episode_batch = (
+            cls_features, part_features, patch_features, labels, roles
+        )
+        global_loss, local_loss, joint_loss, metrics = (
+            trainer._pseudo_incremental_episode(
+                episode_batch, reference_global, reference_parts,
+                0.08, 30, 16.0,
+            )
         )
         total = global_loss + local_loss + joint_loss
         self.assertTrue(torch.isfinite(total))
+        self.assertEqual(metrics["episode_candidate_classes"], 4)
+        self.assertEqual(metrics["episode_base_candidate_classes"], 3)
+        self.assertEqual(metrics["episode_novel_classes"], 1)
+        self.assertEqual(metrics["episode_base_queries"], 2)
+        self.assertEqual(metrics["episode_novel_queries"], 2)
+        self.assertEqual(metrics["episode_support_shots"], 5)
         total.backward()
         self.assertTrue(any(
             parameter.grad is not None and parameter.grad.abs().sum() > 0
@@ -430,6 +458,48 @@ class TestPrototypeAndTransfer(unittest.TestCase):
             parameter.grad is not None and parameter.grad.abs().sum() > 0
             for parameter in reconstructor.parameters()
         ))
+
+
+class TestDisjointFSCILEpisodes(unittest.TestCase):
+    def test_reference_and_episode_partitions_are_disjoint_and_exhaustive(self):
+        labels = np.repeat(np.arange(10), 30)
+        reference, episode = split_reference_episode_indices(
+            labels, reference_fraction=0.7,
+            min_episode_samples=7, seed=13,
+        )
+        self.assertEqual(np.intersect1d(reference, episode).size, 0)
+        self.assertEqual(reference.size + episode.size, labels.size)
+        for cls in range(10):
+            self.assertGreaterEqual((labels[reference] == cls).sum(), 1)
+            self.assertGreaterEqual((labels[episode] == cls).sum(), 7)
+
+    def test_episode_sampler_enforces_five_shot_and_disjoint_queries(self):
+        labels = np.repeat(np.arange(20), 12)
+        episode_indices = np.arange(labels.size)
+        sampler = VSMREpisodeBatchSampler(
+            labels, episode_indices, novel_way=3, base_query_way=4,
+            novel_shot=5, query_per_class=2,
+            base_query_per_class=2, iterations=2, seed=17,
+        )
+        first = next(iter(sampler))
+        roles_by_class = {}
+        for index, role in first:
+            roles_by_class.setdefault(int(labels[index]), []).append(role)
+        novel_classes = [
+            cls for cls, roles in roles_by_class.items()
+            if ROLE_NOVEL_SUPPORT in roles
+        ]
+        self.assertEqual(len(novel_classes), 3)
+        for cls in novel_classes:
+            roles = roles_by_class[cls]
+            self.assertEqual(roles.count(ROLE_NOVEL_SUPPORT), 5)
+            self.assertEqual(roles.count(ROLE_NOVEL_QUERY), 2)
+            self.assertNotIn(ROLE_BASE_QUERY, roles)
+        for cls, roles in roles_by_class.items():
+            if cls not in novel_classes:
+                self.assertEqual(roles.count(ROLE_BASE_QUERY), 2)
+                self.assertNotIn(ROLE_NOVEL_SUPPORT, roles)
+
 
 
 class TestPreprocessingContract(unittest.TestCase):
