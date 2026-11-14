@@ -213,6 +213,16 @@ class TestVisualSemanticDecomposition(unittest.TestCase):
         self.assertTrue(all(not p.requires_grad for p in model.reconstructor.parameters()))
         self.assertTrue(all(not p.requires_grad for p in model.fusion.parameters()))
 
+    def test_prompt_initialization_has_distinct_projected_directions(self):
+        torch.manual_seed(29)
+        module = VisualSemanticDecomposer(embed_dim=24, num_parts=4)
+        queries = F.normalize(
+            module.query_projection(module.shared_prompts), dim=-1
+        )
+        gram = queries @ queries.transpose(0, 1)
+        off_diagonal = ~torch.eye(4, dtype=torch.bool)
+        self.assertLess(float(gram[off_diagonal].abs().mean()), 0.35)
+
     def test_prompt_attention_is_soft_and_differentiable(self):
         torch.manual_seed(11)
         module = VisualSemanticDecomposer(embed_dim=24, num_parts=4)
