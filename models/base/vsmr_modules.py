@@ -135,11 +135,20 @@ class VisualSemanticDecomposer(nn.Module):
         self.shared_prompts = nn.Parameter(
             torch.empty(self.num_parts, self.embed_dim)
         )
-        nn.init.trunc_normal_(self.shared_prompts, std=0.02)
+        # Start the latent slots with distinct directions. This does not
+        # assign semantic labels; it only avoids a symmetric all-slots-equal
+        # initialization from which cosine decorrelation has weak gradients.
+        with torch.no_grad():
+            initial_queries = torch.empty(
+                self.embed_dim, self.num_parts
+            )
+            nn.init.orthogonal_(initial_queries)
+            self.shared_prompts.copy_(initial_queries.transpose(0, 1))
 
         self.query_projection = nn.Linear(
             self.embed_dim, self.embed_dim, bias=False
         )
+        nn.init.orthogonal_(self.query_projection.weight)
         self.key_projection = nn.Linear(
             self.embed_dim, self.embed_dim, bias=False
         )
