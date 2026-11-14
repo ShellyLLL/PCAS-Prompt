@@ -11,6 +11,7 @@ from torchvision import transforms
 
 from models.base.vsmr_losses import (
     attention_overlap_loss,
+    component_diversity_loss,
     fixed_index_component_logits,
     cross_image_semantic_alignment,
     leave_one_out_global,
@@ -18,6 +19,8 @@ from models.base.vsmr_losses import (
     local_logits,
     ot_barycenter,
     ot_distance,
+    prompt_orthogonality_loss,
+    sinkhorn_rectangular_transport,
     sinkhorn_transport,
 )
 from models.base.vsmr_resynthesis import (
@@ -92,6 +95,45 @@ class TestOptimalTransport(unittest.TestCase):
         self.assertTrue(torch.isfinite(center).all())
 
 
+class TestBalancedPromptAssignment(unittest.TestCase):
+    def test_rectangular_sinkhorn_enforces_both_marginals_and_gradients(self):
+        torch.manual_seed(23)
+        logits = torch.randn(3, 4, 19, requires_grad=True)
+        transport = sinkhorn_rectangular_transport(
+            logits, epsilon=0.7, iterations=80
+        )
+        self.assertEqual(transport.shape, (3, 4, 19))
+        self.assertTrue(torch.allclose(
+            transport.sum(-1), torch.full((3, 4), 0.25), atol=2e-3
+        ))
+        self.assertTrue(torch.allclose(
+            transport.sum(-2), torch.full((3, 19), 1.0 / 19), atol=2e-3
+        ))
+        (transport * logits).sum().backward()
+        self.assertIsNotNone(logits.grad)
+        self.assertTrue(torch.isfinite(logits.grad).all())
+
+    def test_prompt_orthogonality_penalizes_collapsed_queries(self):
+        collapsed = torch.ones(4, 12, requires_grad=True)
+        orthogonal = torch.eye(4, 12)
+        collapsed_loss = prompt_orthogonality_loss(collapsed)
+        orthogonal_loss = prompt_orthogonality_loss(orthogonal)
+        self.assertGreater(float(collapsed_loss), float(orthogonal_loss))
+        collapsed_loss.backward()
+        self.assertIsNotNone(collapsed.grad)
+        self.assertTrue(torch.isfinite(collapsed.grad).all())
+
+    def test_component_diversity_penalizes_duplicate_components(self):
+        collapsed = torch.ones(2, 4, 12, requires_grad=True)
+        diverse = torch.stack([torch.eye(4, 12), -torch.eye(4, 12)])
+        collapsed_loss = component_diversity_loss(collapsed, similarity_margin=0.5)
+        diverse_loss = component_diversity_loss(diverse, similarity_margin=0.5)
+        self.assertGreater(float(collapsed_loss), float(diverse_loss))
+        collapsed_loss.backward()
+        self.assertIsNotNone(collapsed.grad)
+        self.assertTrue(torch.isfinite(collapsed.grad).all())
+
+
 class TestGlobalLocalFusion(unittest.TestCase):
     def test_fusion_is_learned_convex_and_differentiable(self):
         fusion = GlobalLocalFusion(global_init=0.5, local_init=0.5)
@@ -144,6 +186,17 @@ class TestVisualSemanticDecomposition(unittest.TestCase):
         self.assertEqual(output["parts"].shape, (2, 4, 24))
         self.assertEqual(output["attention"].shape, (2, 4, 196))
         self.assertEqual(output["patch_features"].shape, (2, 196, 24))
+        self.assertEqual(output["prompt_queries"].shape, (4, 24))
+        self.assertEqual(output["assignment"].shape, (2, 4, 196))
+        self.assertTrue(torch.allclose(
+            output["attention"].sum(-1), torch.ones(2, 4), atol=1e-5
+        ))
+        self.assertTrue(torch.allclose(
+            output["assignment"].sum(-1), torch.full((2, 4), 0.25), atol=2e-3
+        ))
+        self.assertTrue(torch.allclose(
+            output["assignment"].sum(-2), torch.full((2, 196), 1.0 / 196), atol=2e-3
+        ))
         self.assertTrue(all(not p.requires_grad for p in model.backbone.parameters()))
         self.assertTrue(any(p.requires_grad for p in model.decomposer.parameters()))
 
@@ -165,17 +218,33 @@ class TestVisualSemanticDecomposition(unittest.TestCase):
         module = VisualSemanticDecomposer(embed_dim=24, num_parts=4)
         cls = F.normalize(torch.randn(3, 24), dim=-1)
         patches = F.normalize(torch.randn(3, 16, 24), dim=-1)
-        global_features, parts, attention = module(cls, patches)
+        global_features, parts, attention, queries, assignment = module(
+            cls, patches, return_aux=True
+        )
         self.assertEqual(global_features.shape, (3, 24))
         self.assertEqual(parts.shape, (3, 4, 24))
         self.assertEqual(attention.shape, (3, 4, 16))
+        self.assertEqual(queries.shape, (4, 24))
+        self.assertEqual(assignment.shape, (3, 4, 16))
         self.assertTrue(torch.allclose(
-            attention.sum(-1), torch.ones(3, 4), atol=1e-6
+            attention.sum(-1), torch.ones(3, 4), atol=1e-5
+        ))
+        self.assertTrue(torch.allclose(
+            assignment.sum(-1), torch.full((3, 4), 0.25), atol=2e-3
+        ))
+        self.assertTrue(torch.allclose(
+            assignment.sum(-2), torch.full((3, 16), 1.0 / 16), atol=2e-3
         ))
         self.assertTrue(torch.all((attention > 0).sum(-1) > 1))
-        loss = parts.square().mean() + attention_overlap_loss(attention)
+        loss = (
+            parts.square().mean()
+            + attention_overlap_loss(attention)
+            + prompt_orthogonality_loss(queries)
+            + component_diversity_loss(parts)
+        )
         loss.backward()
         self.assertIsNotNone(module.shared_prompts.grad)
+        self.assertTrue(torch.isfinite(module.shared_prompts.grad).all())
 
 
 class TestPrototypeAndTransfer(unittest.TestCase):
