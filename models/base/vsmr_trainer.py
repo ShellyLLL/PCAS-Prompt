@@ -489,6 +489,38 @@ class VSMRFSCILTrainer:
             labels, classes_per_batch,
             int(getattr(self.args, "vsmr_samples_per_class", 4)), self.seed
         )
+        reference_indices, episode_indices = split_reference_episode_indices(
+            labels,
+            reference_fraction=float(getattr(
+                self.args, "vsmr_episode_reference_fraction", 0.7
+            )),
+            min_episode_samples=(
+                int(getattr(self.args, "vsmr_episode_novel_shot", 5))
+                + int(getattr(self.args, "vsmr_episode_query_per_class", 2))
+            ),
+            min_reference_samples=1,
+            seed=self.seed,
+        )
+        episode_novel_way = int(getattr(
+            self.args, "vsmr_episode_novel_way",
+            min(10, int(self.args.base_class) - 1)
+        ))
+        episode_base_query_way = int(getattr(
+            self.args, "vsmr_episode_base_query_way", 16
+        ))
+        episode_sampler = VSMREpisodeBatchSampler(
+            labels,
+            episode_indices,
+            novel_way=episode_novel_way,
+            base_query_way=episode_base_query_way,
+            novel_shot=int(getattr(self.args, "vsmr_episode_novel_shot", 5)),
+            query_per_class=int(getattr(self.args, "vsmr_episode_query_per_class", 2)),
+            base_query_per_class=int(getattr(
+                self.args, "vsmr_episode_base_query_per_class", 2
+            )),
+            iterations=len(sampler),
+            seed=self.seed + 100003,
+        )
         loader = self._loader(trainset, 1, batch_sampler=sampler)
         trainable_parameters = [
             parameter for parameter in self.model.parameters()
@@ -520,6 +552,19 @@ class VSMRFSCILTrainer:
 
         for epoch in range(epochs):
             sampler.set_epoch(epoch)
+            episode_sampler.set_epoch(epoch)
+            reference_global, reference_parts, episode_dataset = (
+                self._build_episode_reference(
+                    trainset, reference_indices, episode_indices
+                )
+            )
+            episode_loader = DataLoader(
+                episode_dataset,
+                batch_sampler=episode_sampler,
+                num_workers=0,
+                pin_memory=self.device.type == "cuda",
+            )
+            episode_iterator = iter(episode_loader)
             self.model.train()
             totals = {k: 0.0 for k in (
                 "total", "global", "local", "joint", "alignment", "cisa", "overlap",
@@ -528,6 +573,10 @@ class VSMRFSCILTrainer:
                 "part_cosine_mean", "part_cosine_max",
                 "assignment_row_error", "assignment_col_error", "attention_entropy",
                 "episode_global", "episode_local", "episode_joint",
+                "episode_candidate_classes", "episode_base_candidate_classes",
+                "episode_novel_classes", "episode_base_queries",
+                "episode_novel_queries", "episode_support_shots",
+                "episode_transfer_alpha", "episode_gate_reliability",
                 "global_acc", "local_acc", "joint_acc", "ot_same"
             )}
             steps = 0
@@ -579,11 +628,17 @@ class VSMRFSCILTrainer:
                 base_joint_logits = self.model.fusion(g_logits, l_logits)
                 base_joint_loss = F.cross_entropy(base_joint_logits, inverse)
 
-                episode_global_loss, episode_local_loss, episode_joint_loss = (
-                    self._pseudo_incremental_episode(
-                        features, parts, patch_features, labels_batch,
-                        eps, sinkhorn_steps, scale,
-                    )
+                try:
+                    episode_batch = next(episode_iterator)
+                except StopIteration:
+                    episode_iterator = iter(episode_loader)
+                    episode_batch = next(episode_iterator)
+                (
+                    episode_global_loss, episode_local_loss,
+                    episode_joint_loss, episode_metrics,
+                ) = self._pseudo_incremental_episode(
+                    episode_batch, reference_global, reference_parts,
+                    eps, sinkhorn_steps, scale,
                 )
                 global_loss = 0.5 * (base_global_loss + episode_global_loss)
                 local_loss = 0.5 * (base_local_loss + episode_local_loss)
@@ -619,6 +674,8 @@ class VSMRFSCILTrainer:
                     totals["episode_global"] += float(episode_global_loss)
                     totals["episode_local"] += float(episode_local_loss)
                     totals["episode_joint"] += float(episode_joint_loss)
+                    for metric_name, metric_value in episode_metrics.items():
+                        totals[metric_name] += float(metric_value)
                     totals["alignment"] += float(align_loss)
                     totals["cisa"] += float(cisa_loss)
                     totals["overlap"] += float(overlap_loss)
