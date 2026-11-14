@@ -263,8 +263,9 @@ class VSMRFSCILTrainer:
         their exact K-shot supports, and jointly classifies pseudo-base and
         pseudo-novel queries against the complete candidate class set.
         """
-        cls_features, patch_features, labels, roles = episode_batch
+        cls_features, part_features, patch_features, labels, roles = episode_batch
         cls_features = cls_features.to(self.device, non_blocking=True)
+        part_features = part_features.to(self.device, non_blocking=True)
         patch_features = patch_features.to(self.device, non_blocking=True)
         labels = labels.to(self.device, non_blocking=True).long()
         roles = roles.to(self.device, non_blocking=True).long()
@@ -302,9 +303,7 @@ class VSMRFSCILTrainer:
         for cls in novel_classes:
             selected = support_mask & labels.eq(cls)
             support_global = cls_features[selected]
-            support_parts = episode_batch[1][selected.cpu()].to(
-                self.device, non_blocking=True
-            )
+            support_parts = part_features[selected]
             if support_global.shape[0] != int(getattr(self.args, "vsmr_episode_novel_shot", 5)):
                 raise RuntimeError("Pseudo-novel support count does not match exact K-shot.")
             local_prototype = ot_barycenter(
@@ -350,9 +349,7 @@ class VSMRFSCILTrainer:
 
         query_mask = base_query_mask | novel_query_mask
         query_features = cls_features[query_mask]
-        query_parts = episode_batch[1][query_mask.cpu()].to(
-            self.device, non_blocking=True
-        )
+        query_parts = part_features[query_mask]
         query_patches = patch_features[query_mask]
         query_labels = labels[query_mask]
         targets = []
@@ -464,6 +461,7 @@ class VSMRFSCILTrainer:
         )
         episode_dataset = VSMREpisodeFeatureDataset(
             features[episode_indices_tensor],
+            parts[episode_indices_tensor],
             patches[episode_indices_tensor],
             extracted_labels[episode_indices_tensor],
         )
