@@ -54,27 +54,31 @@ class ImageLabelDataset(Dataset):
 
 
 class ClassBalancedBatchSampler(Sampler):
-    def __init__(self, labels, classes_per_batch=16, samples_per_class=4, seed=1):
+    def __init__(self, labels, classes_per_batch=16, samples_per_class=4, seed=1, indices=None):
         self.labels = np.asarray(labels, dtype=np.int64)
         self.classes_per_batch = int(classes_per_batch)
         self.samples_per_class = int(samples_per_class)
         self.seed = int(seed)
         self.epoch = 0
+        indices = np.arange(self.labels.size, dtype=np.int64) if indices is None else np.asarray(indices, dtype=np.int64)
+        if indices.ndim != 1 or indices.size == 0 or np.any(indices < 0) or np.any(indices >= self.labels.size):
+            raise ValueError("Class-balanced sampling indices must be non-empty and in range.")
+        if np.unique(indices).size != indices.size:
+            raise ValueError("Class-balanced sampling indices must be unique.")
+        self.indices = indices
+        selected_labels = self.labels[indices]
         self.class_to_indices = {
-            int(c): np.flatnonzero(self.labels == c).tolist()
-            for c in np.unique(self.labels)
+            int(c): indices[selected_labels == c].tolist()
+            for c in np.unique(selected_labels)
         }
         if self.classes_per_batch < 2 or self.samples_per_class < 2:
             raise ValueError("VSMR requires >=2 classes and >=2 samples per class.")
         if len(self.class_to_indices) < self.classes_per_batch:
             raise ValueError("Not enough base classes for classes_per_batch.")
-        for cls, indices in self.class_to_indices.items():
-            if len(indices) < self.samples_per_class:
+        for cls, values in self.class_to_indices.items():
+            if len(values) < self.samples_per_class:
                 raise ValueError("Class {} has too few samples.".format(cls))
-        self.iterations = max(
-            1, int(np.ceil(len(self.labels) /
-                           (self.classes_per_batch * self.samples_per_class)))
-        )
+        self.iterations = max(1, int(np.ceil(indices.size / (self.classes_per_batch * self.samples_per_class))))
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
@@ -252,266 +256,190 @@ class VSMRFSCILTrainer:
 
 
     def _pseudo_incremental_episode(
-        self, episode_batch, reference_global, reference_parts,
+        self, episode_batch, backbone_dataset, reference_indices_by_class,
         epsilon, sinkhorn_steps, logit_scale,
     ):
-        """Train transfer/reconstruction with full-class, disjoint FSCIL episodes.
-
-        The reference memory is extracted from a per-class image partition
-        disjoint from every episode support/query. Each episode hides a set of
-        pseudo-novel classes from the full base reference memory, composes
-        their exact K-shot supports, and jointly classifies pseudo-base and
-        pseudo-novel queries against the complete candidate class set.
-        """
-        cls_features, part_features, patch_features, labels, roles = episode_batch
-        cls_features = cls_features.to(self.device, non_blocking=True)
-        part_features = part_features.to(self.device, non_blocking=True)
-        patch_features = patch_features.to(self.device, non_blocking=True)
+        """Run live trainable decomposition over frozen-backbone episode inputs."""
+        cls_backbone, patch_backbone, labels, roles = episode_batch
+        cls_backbone = cls_backbone.to(self.device, non_blocking=True).float()
+        patch_backbone = patch_backbone.to(self.device, non_blocking=True).float()
         labels = labels.to(self.device, non_blocking=True).long()
         roles = roles.to(self.device, non_blocking=True).long()
-
         support_mask = roles == ROLE_NOVEL_SUPPORT
         novel_query_mask = roles == ROLE_NOVEL_QUERY
         base_query_mask = roles == ROLE_BASE_QUERY
         if not support_mask.any() or not novel_query_mask.any() or not base_query_mask.any():
             raise RuntimeError("Episode must contain novel supports and both query roles.")
-
         novel_classes = torch.unique(labels[support_mask], sorted=True)
-        if not torch.equal(
-            torch.unique(labels[novel_query_mask], sorted=True), novel_classes
-        ):
+        if not torch.equal(torch.unique(labels[novel_query_mask], sorted=True), novel_classes):
             raise RuntimeError("Every pseudo-novel class must have support and query samples.")
         if torch.isin(labels[base_query_mask], novel_classes).any():
             raise RuntimeError("Pseudo-base query labels overlap pseudo-novel classes.")
-
-        all_base_classes = torch.arange(
-            int(self.args.base_class), device=self.device, dtype=torch.long
-        )
-        keep_base = ~torch.isin(all_base_classes, novel_classes)
-        base_classes = all_base_classes[keep_base]
-        if base_classes.numel() < 1:
+        all_base = torch.arange(int(self.args.base_class), device=self.device)
+        base_classes = all_base[~torch.isin(all_base, novel_classes)]
+        if base_classes.numel() == 0:
             raise RuntimeError("Episode removed every pseudo-base class.")
-
-        # Reference memory was built from the disjoint reference image split.
-        base_global = reference_global[base_classes]
-        base_parts = reference_parts[base_classes]
-        base_bank, base_owner, _ = build_base_component_bank(base_parts)
-
-        novel_global = []
-        novel_raw_parts = []
-        novel_variance = []
-        for cls in novel_classes:
-            selected = support_mask & labels.eq(cls)
-            support_global = cls_features[selected]
-            support_parts = part_features[selected]
-            if support_global.shape[0] != int(getattr(self.args, "vsmr_episode_novel_shot", 5)):
-                raise RuntimeError("Pseudo-novel support count does not match exact K-shot.")
-            local_prototype = ot_barycenter(
-                support_parts, epsilon, sinkhorn_steps,
-                int(getattr(self.args, "vsmr_barycenter_iterations", 5)),
-            )
-            novel_global.append(F.normalize(support_global.mean(0), dim=-1))
-            novel_raw_parts.append(local_prototype)
-            novel_variance.append(component_support_variance(
-                support_parts, local_prototype, epsilon, sinkhorn_steps
-            ))
-
-        novel_global = torch.stack(novel_global)
-        novel_raw_parts = torch.stack(novel_raw_parts)
-        novel_variance = torch.stack(novel_variance)
+        refs_per_class = int(getattr(self.args, "vsmr_episode_reference_samples_per_class", 4))
+        if refs_per_class < 1:
+            raise ValueError("Reference samples per class must be positive.")
+        ref_ids = []
+        for cls in base_classes.tolist():
+            available = torch.as_tensor(reference_indices_by_class[int(cls)], dtype=torch.long)
+            if available.numel() < refs_per_class:
+                raise RuntimeError("Reference Pool class {} has insufficient samples.".format(cls))
+            ref_ids.extend(available[torch.randperm(available.numel())[:refs_per_class]].tolist())
+        ref_ids = torch.as_tensor(ref_ids, dtype=torch.long)
+        ref_cls = backbone_dataset.cls_features[ref_ids].to(self.device, non_blocking=True).float()
+        ref_patches = backbone_dataset.patch_features[ref_ids].to(self.device, non_blocking=True).float()
+        n_ref = ref_cls.shape[0]
+        all_cls = torch.cat([ref_cls, cls_backbone], dim=0)
+        all_patches = torch.cat([ref_patches, patch_backbone], dim=0)
+        all_global, all_parts, _, _, _ = self.model.decomposer(all_cls, all_patches, return_aux=True)
+        ref_global = all_global[:n_ref].reshape(base_classes.numel(), refs_per_class, -1)
+        ref_parts = all_parts[:n_ref].reshape(base_classes.numel(), refs_per_class, all_parts.shape[1], all_parts.shape[2])
+        base_global = F.normalize(ref_global.mean(1), dim=-1)
+        base_parts = torch.stack([
+            ot_barycenter(ref_parts[i], epsilon, sinkhorn_steps,
+                          int(getattr(self.args, "vsmr_barycenter_iterations", 5)))
+            for i in range(base_classes.numel())
+        ])
+        episode_global, episode_parts = all_global[n_ref:], all_parts[n_ref:]
+        novel_global, novel_raw, novel_var = [], [], []
         shots = int(getattr(self.args, "vsmr_episode_novel_shot", 5))
-        novel_parts, alpha, reliability, selected, transfer_weights = compose_novel_prototypes(
-            novel_raw_parts,
-            base_bank,
-            self.model.reliability_gate,
-            base_owner=base_owner,
+        for cls in novel_classes:
+            mask = support_mask & labels.eq(cls)
+            support_global, support_parts = episode_global[mask], episode_parts[mask]
+            if support_global.shape[0] != shots:
+                raise RuntimeError("Pseudo-novel support count does not match exact K-shot.")
+            proto = ot_barycenter(support_parts, epsilon, sinkhorn_steps,
+                                  int(getattr(self.args, "vsmr_barycenter_iterations", 5)))
+            novel_global.append(F.normalize(support_global.mean(0), dim=-1))
+            novel_raw.append(proto)
+            novel_var.append(component_support_variance(support_parts, proto, epsilon, sinkhorn_steps))
+        novel_global, novel_raw, novel_var = torch.stack(novel_global), torch.stack(novel_raw), torch.stack(novel_var)
+        bank, owner, _ = build_base_component_bank(base_parts)
+        novel_parts, alpha, reliability, _, _ = compose_novel_prototypes(
+            novel_raw, bank, self.model.reliability_gate, base_owner=owner,
             top_r=int(getattr(self.args, "vsmr_transfer_top_r", 5)),
             alpha_max=float(getattr(self.args, "vsmr_transfer_alpha_max", 0.5)),
             similarity_temperature=float(getattr(self.args, "vsmr_transfer_temperature", 0.1)),
-            support_variance=novel_variance,
-            shots=shots,
+            support_variance=novel_var, shots=shots,
         )
-
-        # Candidate order is all retained base IDs in ascending order,
-        # followed by the sorted pseudo-novel IDs.
-        candidate_global = torch.cat([base_global, novel_global], dim=0)
-        candidate_parts = torch.cat([base_parts, novel_parts], dim=0)
-        base_target_map = torch.full(
-            (int(self.args.base_class),), -1, dtype=torch.long, device=self.device
-        )
-        base_target_map[base_classes] = torch.arange(
-            base_classes.numel(), device=self.device
-        )
-        novel_target_map = {
-            int(cls): int(base_classes.numel()) + position
-            for position, cls in enumerate(novel_classes.tolist())
-        }
-
-        query_mask = base_query_mask | novel_query_mask
-        query_features = cls_features[query_mask]
-        query_parts = part_features[query_mask]
-        query_patches = patch_features[query_mask]
-        query_labels = labels[query_mask]
+        candidates_global = torch.cat([base_global, novel_global], dim=0)
+        candidates_parts = torch.cat([base_parts, novel_parts], dim=0)
+        base_map = torch.full((int(self.args.base_class),), -1, dtype=torch.long, device=self.device)
+        base_map[base_classes] = torch.arange(base_classes.numel(), device=self.device)
+        novel_map = {int(c): int(base_classes.numel()) + i for i, c in enumerate(novel_classes.tolist())}
+        qmask = base_query_mask | novel_query_mask
+        qglobal, qparts, qpatches, qlabels = episode_global[qmask], episode_parts[qmask], patch_backbone[qmask], labels[qmask]
         targets = []
-        for cls in query_labels.tolist():
-            if cls in novel_target_map:
-                targets.append(novel_target_map[cls])
+        for cls in qlabels.tolist():
+            if cls in novel_map:
+                targets.append(novel_map[cls])
             else:
-                target = int(base_target_map[cls].item())
+                target = int(base_map[cls].item())
                 if target < 0:
-                    raise RuntimeError("Query class is absent from the candidate memory.")
+                    raise RuntimeError("Query class is absent from candidate memory.")
                 targets.append(target)
         targets = torch.tensor(targets, dtype=torch.long, device=self.device)
-
-        global_scores = global_logits(
-            query_features, candidate_global, logit_scale
-        )
+        global_scores = global_logits(qglobal, candidates_global, logit_scale)
         local_scores, _, _, _ = query_conditioned_reconstruction(
-            query_parts, query_patches, candidate_parts,
-            self.model.reconstructor,
-            epsilon=epsilon, iterations=sinkhorn_steps, scale=logit_scale,
-        )
+            qparts, qpatches, candidates_parts, self.model.reconstructor,
+            epsilon=epsilon, iterations=sinkhorn_steps, scale=logit_scale)
         joint_scores = self.model.fusion(global_scores, local_scores)
-
-        base_query_count = int(base_query_mask.sum().item())
-        novel_query_count = int(novel_query_mask.sum().item())
-        if base_query_count == 0 or novel_query_count == 0:
-            raise RuntimeError("Episode requires both base and novel queries.")
         return (
             F.cross_entropy(global_scores, targets),
             F.cross_entropy(local_scores, targets),
             F.cross_entropy(joint_scores, targets),
-            {
-                "episode_candidate_classes": int(candidate_global.shape[0]),
-                "episode_base_candidate_classes": int(base_classes.numel()),
-                "episode_novel_classes": int(novel_classes.numel()),
-                "episode_base_queries": base_query_count,
-                "episode_novel_queries": novel_query_count,
-                "episode_support_shots": shots,
-                "episode_transfer_alpha": float(alpha.detach().mean()),
-                "episode_gate_reliability": float(reliability.detach().mean()),
-            },
+            {"episode_candidate_classes": int(candidates_global.shape[0]),
+             "episode_base_candidate_classes": int(base_classes.numel()),
+             "episode_novel_classes": int(novel_classes.numel()),
+             "episode_base_queries": int(base_query_mask.sum()),
+             "episode_novel_queries": int(novel_query_mask.sum()),
+             "episode_support_shots": shots,
+             "episode_reference_samples_per_class": refs_per_class,
+             "episode_reference_images": int(n_ref),
+             "episode_transfer_alpha": float(alpha.detach().mean()),
+             "episode_gate_reliability": float(reliability.detach().mean())},
         )
 
     @torch.no_grad()
-    def _build_episode_reference(
-        self, trainset, reference_indices, episode_indices,
-    ):
-        """Recompute full base-class features and create disjoint episode cache."""
+    def _build_episode_reference(self, trainset, reference_indices, episode_indices):
+        """Cache only frozen ViT outputs in the original full dataset index space."""
         original = getattr(trainset, "transform", None)
         if original is None:
             raise RuntimeError("Episode reference dataset must expose a transform.")
         trainset.transform = self._transform()
-        loader = self._loader(
-            trainset, int(getattr(self.args, "vsmr_eval_batch_size", 8))
-        )
-        globals_, parts_, patches_, labels_ = [], [], [], []
+        loader = self._loader(trainset, int(getattr(self.args, "vsmr_eval_batch_size", 8)))
+        cls_values, patch_values, labels_values = [], [], []
         was_training = self.model.training
         self.model.eval()
         try:
-            for images, batch_labels in loader:
-                output = self.model(images.to(self.device, non_blocking=True))
-                # Keep the full-set feature cache on CPU. CUB base training
-                # stores several thousand 196x768 Patch tensors; retaining all
-                # of them on GPU would needlessly consume multiple GB.
-                globals_.append(output["global_features"].cpu())
-                parts_.append(output["parts"].cpu())
-                patches_.append(output["patch_features"].cpu())
-                labels_.append(torch.as_tensor(batch_labels).long())
+            for images, labels in tqdm(loader, desc="VSMR frozen-backbone cache"):
+                cls, patches = self.model.backbone(images.to(self.device, non_blocking=True))
+                cls_values.append(cls.cpu())
+                patch_values.append(patches.cpu())
+                labels_values.append(torch.as_tensor(labels).long())
         finally:
             trainset.transform = original
             if was_training:
                 self.model.train()
+        cls_values, patch_values = torch.cat(cls_values), torch.cat(patch_values)
+        cached_labels = torch.cat(labels_values)
+        if not torch.equal(torch.unique(cached_labels, sorted=True), torch.arange(int(self.args.base_class))):
+            raise RuntimeError("Frozen-backbone cache must contain every base class.")
+        if not torch.equal(cached_labels, torch.as_tensor(trainset.targets, dtype=torch.long)):
+            raise RuntimeError("Frozen-backbone cache label order differs from source dataset.")
+        reference_indices, episode_indices = np.asarray(reference_indices, dtype=np.int64), np.asarray(episode_indices, dtype=np.int64)
+        if np.intersect1d(reference_indices, episode_indices).size:
+            raise RuntimeError("Reference and episode image indices overlap.")
+        if not np.array_equal(np.sort(np.concatenate([reference_indices, episode_indices])), np.arange(len(trainset))):
+            raise RuntimeError("Reference and episode pools must exhaust the base training set.")
+        ref_tensor = torch.as_tensor(reference_indices, dtype=torch.long)
+        ref_labels = cached_labels[ref_tensor]
+        refs_per_class = int(getattr(self.args, "vsmr_episode_reference_samples_per_class", 4))
+        refs_by_class = {}
+        for cls in range(int(self.args.base_class)):
+            ids = ref_tensor[ref_labels.eq(cls)]
+            if ids.numel() < refs_per_class:
+                raise RuntimeError("Reference Pool class {} has insufficient samples.".format(cls))
+            refs_by_class[cls] = ids
+        dataset = VSMRBackboneFeatureDataset(cls_values, patch_values, cached_labels)
+        cache_bytes = cls_values.numel()*cls_values.element_size() + patch_values.numel()*patch_values.element_size()
+        self._append_log({"stage":"episode_backbone_cache","cached_images":int(cached_labels.numel()),
+            "reference_images":int(reference_indices.size),"episode_images":int(episode_indices.size),
+            "reference_samples_per_class":refs_per_class,"patch_tokens":int(patch_values.shape[1]),
+            "embedding_dim":int(patch_values.shape[2]),"cache_bytes":int(cache_bytes),
+            "cache_gib":float(cache_bytes/(1024.0**3)),"decomposed_features_cached":False})
+        return dataset, refs_by_class
 
-        features = torch.cat(globals_)
-        parts = torch.cat(parts_)
-        patches = torch.cat(patches_)
-        extracted_labels = torch.cat(labels_)
-        expected = torch.arange(int(self.args.base_class), dtype=torch.long)
-        if not torch.equal(torch.unique(extracted_labels, sorted=True), expected):
-            raise RuntimeError("Episode feature cache must contain every base class.")
-        reference_global = []
-        reference_parts = []
-        reference_labels = extracted_labels[torch.as_tensor(reference_indices, dtype=torch.long)]
-        reference_features = features[torch.as_tensor(reference_indices, dtype=torch.long)]
-        reference_components = parts[torch.as_tensor(reference_indices, dtype=torch.long)]
-        for cls in expected:
-            selected = reference_labels.eq(cls)
-            if not selected.any():
-                raise RuntimeError("Reference memory missing base class {}.".format(int(cls)))
-            class_features = reference_features[selected].to(self.device, non_blocking=True)
-            class_components = reference_components[selected].to(self.device, non_blocking=True)
-            reference_global.append(F.normalize(class_features.mean(0), dim=-1))
-            reference_parts.append(ot_barycenter(
-                class_components,
-                float(getattr(self.args, "vsmr_ot_epsilon", 0.05)),
-                int(getattr(self.args, "vsmr_sinkhorn_iterations", 30)),
-                int(getattr(self.args, "vsmr_barycenter_iterations", 5)),
-            ))
-
-        episode_indices_tensor = torch.as_tensor(episode_indices, dtype=torch.long)
-        episode_dataset = VSMREpisodeFeatureDataset(
-            features[episode_indices_tensor],
-            parts[episode_indices_tensor],
-            patches[episode_indices_tensor],
-            extracted_labels[episode_indices_tensor],
-        )
-        return (
-            torch.stack(reference_global).detach(),
-            torch.stack(reference_parts).detach(),
-            episode_dataset,
-        )
 
     def _train_base(self, trainset):
-        # Replace legacy dataset transforms before creating the DataLoader:
-        # training augmentation is retained, while normalization/interpolation
-        # are now tied to the frozen ViT checkpoint.
         trainset.transform = self._training_transform()
         labels = np.asarray(trainset.targets, dtype=np.int64)
         if not np.array_equal(np.unique(labels), np.arange(int(self.args.base_class))):
             raise RuntimeError("Base labels must be contiguous [0, base_class).")
-        classes_per_batch = min(
-            int(getattr(self.args, "vsmr_classes_per_batch", 16)),
-            int(self.args.base_class),
-        )
-        sampler = ClassBalancedBatchSampler(
-            labels, classes_per_batch,
-            int(getattr(self.args, "vsmr_samples_per_class", 4)), self.seed
-        )
+        refs_per_class = int(getattr(self.args, "vsmr_episode_reference_samples_per_class", 4))
         reference_indices, episode_indices = split_reference_episode_indices(
-            labels,
-            reference_fraction=float(getattr(
-                self.args, "vsmr_episode_reference_fraction", 0.7
-            )),
-            min_episode_samples=(
-                int(getattr(self.args, "vsmr_episode_novel_shot", 5))
-                + int(getattr(self.args, "vsmr_episode_query_per_class", 2))
-            ),
-            min_reference_samples=1,
-            seed=self.seed,
-        )
-        episode_novel_way = int(getattr(
-            self.args, "vsmr_episode_novel_way",
-            min(10, int(self.args.base_class) - 1)
-        ))
-        episode_base_query_way = int(getattr(
-            self.args, "vsmr_episode_base_query_way", 16
-        ))
-        episode_sampler = VSMREpisodeBatchSampler(
-            labels,
-            episode_indices,
-            novel_way=episode_novel_way,
-            base_query_way=episode_base_query_way,
+            labels, reference_fraction=float(getattr(self.args, "vsmr_episode_reference_fraction", 0.7)),
+            min_episode_samples=(int(getattr(self.args, "vsmr_episode_novel_shot", 5))+
+                                 int(getattr(self.args, "vsmr_episode_query_per_class", 2))),
+            min_reference_samples=refs_per_class, seed=self.seed)
+        classes_per_batch = min(int(getattr(self.args, "vsmr_classes_per_batch", 16)), int(self.args.base_class))
+        sampler = ClassBalancedBatchSampler(labels, classes_per_batch,
+            int(getattr(self.args, "vsmr_samples_per_class", 4)), self.seed, indices=reference_indices)
+        episode_sampler = VSMREpisodeBatchSampler(labels, episode_indices,
+            novel_way=int(getattr(self.args, "vsmr_episode_novel_way", min(10, int(self.args.base_class)-1))),
+            base_query_way=int(getattr(self.args, "vsmr_episode_base_query_way", 16)),
             novel_shot=int(getattr(self.args, "vsmr_episode_novel_shot", 5)),
             query_per_class=int(getattr(self.args, "vsmr_episode_query_per_class", 2)),
-            base_query_per_class=int(getattr(
-                self.args, "vsmr_episode_base_query_per_class", 2
-            )),
-            iterations=len(sampler),
-            seed=self.seed + 100003,
-        )
+            base_query_per_class=int(getattr(self.args, "vsmr_episode_base_query_per_class", 2)),
+            iterations=len(sampler), seed=self.seed+100003)
         loader = self._loader(trainset, 1, batch_sampler=sampler)
-        trainable_parameters = [
+        episode_dataset, refs_by_class = self._build_episode_reference(trainset, reference_indices, episode_indices)
+        episode_loader = DataLoader(episode_dataset, batch_sampler=episode_sampler,
+            num_workers=0, pin_memory=self.device.type == "cuda")
+        trainable_parameters = [        trainable_parameters = [
             parameter for parameter in self.model.parameters()
             if parameter.requires_grad
         ]
@@ -522,7 +450,7 @@ class VSMRFSCILTrainer:
             lr=float(getattr(self.args, "vsmr_lr", 2e-4)),
             weight_decay=float(getattr(self.args, "vsmr_weight_decay", 1e-4)),
         )
-        epochs = int(self.args.epochs_base)
+        epochs = 1 if bool(getattr(self.args, "vsmr_smoke_test", False)) else int(self.args.epochs_base)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=max(1, epochs)
         )
@@ -542,17 +470,6 @@ class VSMRFSCILTrainer:
         for epoch in range(epochs):
             sampler.set_epoch(epoch)
             episode_sampler.set_epoch(epoch)
-            reference_global, reference_parts, episode_dataset = (
-                self._build_episode_reference(
-                    trainset, reference_indices, episode_indices
-                )
-            )
-            episode_loader = DataLoader(
-                episode_dataset,
-                batch_sampler=episode_sampler,
-                num_workers=0,
-                pin_memory=self.device.type == "cuda",
-            )
             episode_iterator = iter(episode_loader)
             self.model.train()
             totals = {k: 0.0 for k in (
@@ -565,6 +482,7 @@ class VSMRFSCILTrainer:
                 "episode_candidate_classes", "episode_base_candidate_classes",
                 "episode_novel_classes", "episode_base_queries",
                 "episode_novel_queries", "episode_support_shots",
+                "episode_reference_samples_per_class", "episode_reference_images",
                 "episode_transfer_alpha", "episode_gate_reliability",
                 "global_acc", "local_acc", "joint_acc", "ot_same"
             )}
@@ -626,7 +544,7 @@ class VSMRFSCILTrainer:
                     episode_global_loss, episode_local_loss,
                     episode_joint_loss, episode_metrics,
                 ) = self._pseudo_incremental_episode(
-                    episode_batch, reference_global, reference_parts,
+                    episode_batch, episode_dataset, refs_by_class,
                     eps, sinkhorn_steps, scale,
                 )
                 global_loss = 0.5 * (base_global_loss + episode_global_loss)
@@ -1020,21 +938,27 @@ class VSMRFSCILTrainer:
         session_macro = [base_metrics["class_average_accuracy"]]
         session_sample = [base_metrics["sample_accuracy"]]
 
-        for session in range(1, int(self.args.sessions)):
+        smoke_test = bool(getattr(self.args, "vsmr_smoke_test", False))
+        session_stop = min(int(self.args.sessions), 2) if smoke_test else int(self.args.sessions)
+        for session in range(1, session_stop):
             support, _, testloader = get_new_dataloader(self.args, session)
             self._incremental(support, testloader.dataset, session)
             record = self.results[-1]
             session_macro.append(record["class_average_accuracy"])
             session_sample.append(record["sample_accuracy"])
 
-        summary = {
-            "stage": "summary", "method": "VSMR",
-            "AA": float(np.mean(session_macro)),
-            "PD": float(session_macro[0] - session_macro[-1]),
-            "session_class_average_accuracy": session_macro,
-            "session_sample_accuracy": session_sample,
-            "elapsed_minutes": (time.time() - start) / 60.0,
-        }
+        if smoke_test:
+            summary = {"stage":"smoke_summary","method":"VSMR","complete_fscil":False,
+                "evaluated_sessions":len(session_macro),"partial_AA":float(np.mean(session_macro)),
+                "partial_PD":float(session_macro[0]-session_macro[-1]),
+                "session_class_average_accuracy":session_macro,"session_sample_accuracy":session_sample,
+                "elapsed_minutes":(time.time()-start)/60.0}
+        else:
+            summary = {"stage":"summary","method":"VSMR","complete_fscil":True,
+                "evaluated_sessions":len(session_macro),"AA":float(np.mean(session_macro)),
+                "PD":float(session_macro[0]-session_macro[-1]),
+                "session_class_average_accuracy":session_macro,"session_sample_accuracy":session_sample,
+                "elapsed_minutes":(time.time()-start)/60.0}
         self._append_log(summary)
         torch.save({
             "model": self.model.state_dict(),
