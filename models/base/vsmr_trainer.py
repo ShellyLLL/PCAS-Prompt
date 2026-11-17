@@ -439,7 +439,7 @@ class VSMRFSCILTrainer:
         episode_dataset, refs_by_class = self._build_episode_reference(trainset, reference_indices, episode_indices)
         episode_loader = DataLoader(episode_dataset, batch_sampler=episode_sampler,
             num_workers=0, pin_memory=self.device.type == "cuda")
-        trainable_parameters = [        trainable_parameters = [
+        trainable_parameters = [
             parameter for parameter in self.model.parameters()
             if parameter.requires_grad
         ]
