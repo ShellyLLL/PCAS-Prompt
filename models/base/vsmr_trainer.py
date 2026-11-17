@@ -17,7 +17,7 @@ from dataloader.data_utils import (
 from .vsmr_modules import VSMRViT
 from .vsmr_episodes import (
     ROLE_BASE_QUERY, ROLE_NOVEL_SUPPORT, ROLE_NOVEL_QUERY,
-    VSMREpisodeBatchSampler, VSMREpisodeFeatureDataset,
+    VSMRBackboneFeatureDataset, VSMREpisodeBatchSampler,
     split_reference_episode_indices,
 )
 from .vsmr_losses import (

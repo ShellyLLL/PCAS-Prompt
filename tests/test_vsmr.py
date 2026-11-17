@@ -41,7 +41,8 @@ from models.base.vsmr_modules import VisualSemanticDecomposer, VSMRViT
 from models.base.vsmr_trainer import ClassBalancedBatchSampler, VSMRFSCILTrainer
 from models.base.vsmr_episodes import (
     ROLE_BASE_QUERY, ROLE_NOVEL_SUPPORT, ROLE_NOVEL_QUERY,
-    VSMREpisodeBatchSampler, split_reference_episode_indices,
+    VSMRBackboneFeatureDataset, VSMREpisodeBatchSampler,
+    split_reference_episode_indices,
 )
 
 
@@ -396,48 +397,58 @@ class TestPrototypeAndTransfer(unittest.TestCase):
         self.assertIsNotNone(patches.grad)
         self.assertIsNotNone(reconstructor.query_projection.weight.grad)
 
-    def test_pseudo_incremental_episode_uses_full_base_memory_and_exact_five_shot(self):
+    def test_pseudo_incremental_episode_backpropagates_through_live_decomposer(self):
         trainer = VSMRFSCILTrainer.__new__(VSMRFSCILTrainer)
         trainer.device = torch.device("cpu")
         trainer.args = SimpleNamespace(
             base_class=4,
             vsmr_episode_novel_shot=5,
+            vsmr_episode_reference_samples_per_class=2,
             vsmr_barycenter_iterations=2,
             vsmr_transfer_top_r=2,
             vsmr_transfer_alpha_max=0.5,
             vsmr_transfer_temperature=0.1,
-            vsmr_global_weight=0.5,
-            vsmr_local_weight_eval=0.5,
+        )
+        decomposer = VisualSemanticDecomposer(
+            embed_dim=8, num_parts=4,
+            assignment_epsilon=0.5, sinkhorn_iterations=20,
         )
         gate = ReliabilityGate(embed_dim=8, hidden_dim=16)
         reconstructor = QueryConditionedReconstructor(embed_dim=8)
         trainer.model = SimpleNamespace(
+            decomposer=decomposer,
             reliability_gate=gate,
             reconstructor=reconstructor,
             fusion=GlobalLocalFusion(),
         )
+
         torch.manual_seed(31)
-        reference_global = F.normalize(torch.randn(4, 8), dim=-1)
-        reference_parts = F.normalize(torch.randn(4, 4, 8), dim=-1)
+        reference_cls = F.normalize(torch.randn(8, 8), dim=-1)
+        reference_patches = F.normalize(torch.randn(8, 10, 8), dim=-1)
+        reference_labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
+        reference_dataset = VSMRBackboneFeatureDataset(
+            reference_cls, reference_patches, reference_labels
+        )
+        reference_indices_by_class = {
+            cls: torch.tensor([2 * cls, 2 * cls + 1])
+            for cls in range(4)
+        }
 
         # One pseudo-novel class (class 3): five support, two novel queries.
-        # Two retained pseudo-base classes contribute two independent queries
-        # each; class 2 remains in the full candidate memory without a query.
-        cls_features = F.normalize(torch.randn(9, 8), dim=-1)
-        part_features = F.normalize(torch.randn(9, 4, 8), dim=-1)
-        patch_features = F.normalize(torch.randn(9, 10, 8), dim=-1)
+        # Two retained pseudo-base classes contribute two independent queries;
+        # class 2 remains in the full candidate memory without a query.
+        cls_backbone = F.normalize(torch.randn(9, 8), dim=-1)
+        patch_backbone = F.normalize(torch.randn(9, 10, 8), dim=-1)
         labels = torch.tensor([3] * 7 + [0, 1])
         roles = torch.tensor(
             [ROLE_NOVEL_SUPPORT] * 5
             + [ROLE_NOVEL_QUERY] * 2
             + [ROLE_BASE_QUERY] * 2
         )
-        episode_batch = (
-            cls_features, part_features, patch_features, labels, roles
-        )
+        episode_batch = (cls_backbone, patch_backbone, labels, roles)
         global_loss, local_loss, joint_loss, metrics = (
             trainer._pseudo_incremental_episode(
-                episode_batch, reference_global, reference_parts,
+                episode_batch, reference_dataset, reference_indices_by_class,
                 0.08, 30, 16.0,
             )
         )
@@ -449,6 +460,8 @@ class TestPrototypeAndTransfer(unittest.TestCase):
         self.assertEqual(metrics["episode_base_queries"], 2)
         self.assertEqual(metrics["episode_novel_queries"], 2)
         self.assertEqual(metrics["episode_support_shots"], 5)
+        self.assertEqual(metrics["episode_reference_samples_per_class"], 2)
+        self.assertEqual(metrics["episode_reference_images"], 6)
         total.backward()
         self.assertTrue(any(
             parameter.grad is not None and parameter.grad.abs().sum() > 0
@@ -458,6 +471,10 @@ class TestPrototypeAndTransfer(unittest.TestCase):
             parameter.grad is not None and parameter.grad.abs().sum() > 0
             for parameter in reconstructor.parameters()
         ))
+        self.assertIsNotNone(decomposer.shared_prompts.grad)
+        self.assertGreater(float(decomposer.shared_prompts.grad.abs().sum()), 0.0)
+        self.assertIsNotNone(decomposer.key_projection.weight.grad)
+        self.assertGreater(float(decomposer.key_projection.weight.grad.abs().sum()), 0.0)
 
 
 class TestDisjointFSCILEpisodes(unittest.TestCase):
@@ -473,19 +490,33 @@ class TestDisjointFSCILEpisodes(unittest.TestCase):
             self.assertGreaterEqual((labels[reference] == cls).sum(), 1)
             self.assertGreaterEqual((labels[episode] == cls).sum(), 7)
 
-    def test_feature_dataset_returns_separate_cls_parts_patches_and_role(self):
-        from models.base.vsmr_episodes import VSMREpisodeFeatureDataset
-        cls = torch.randn(8, 12)
-        parts = torch.randn(8, 4, 12)
-        patches = torch.randn(8, 16, 12)
-        labels = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
-        dataset = VSMREpisodeFeatureDataset(cls, parts, patches, labels)
-        sample = dataset[(3, ROLE_NOVEL_SUPPORT)]
-        self.assertEqual(sample[0].shape, (12,))
-        self.assertEqual(sample[1].shape, (4, 12))
-        self.assertEqual(sample[2].shape, (16, 12))
-        self.assertEqual(int(sample[3]), 0)
-        self.assertEqual(int(sample[4]), ROLE_NOVEL_SUPPORT)
+    def test_backbone_cache_keeps_global_indices_for_noncontiguous_episode_pool(self):
+        labels = np.repeat(np.arange(20), 20)
+        episode_indices = np.concatenate([
+            np.arange(cls * 20 + 10, cls * 20 + 20)
+            for cls in range(20)
+        ])
+        cls_features = torch.arange(labels.size * 4, dtype=torch.float32).reshape(-1, 4)
+        patch_features = torch.arange(labels.size * 6 * 4, dtype=torch.float32).reshape(
+            labels.size, 6, 4
+        )
+        dataset = VSMRBackboneFeatureDataset(
+            cls_features, patch_features, torch.as_tensor(labels)
+        )
+        sampler = VSMREpisodeBatchSampler(
+            labels, episode_indices, novel_way=3, base_query_way=4,
+            novel_shot=5, query_per_class=2,
+            base_query_per_class=2, iterations=1, seed=17,
+        )
+        tagged = next(iter(sampler))
+        episode_index_set = set(episode_indices.tolist())
+        self.assertTrue(all(index in episode_index_set for index, _ in tagged))
+        for index, role in tagged:
+            sample = dataset[(index, role)]
+            self.assertTrue(torch.equal(sample[0], cls_features[index]))
+            self.assertTrue(torch.equal(sample[1], patch_features[index]))
+            self.assertEqual(int(sample[2]), int(labels[index]))
+            self.assertEqual(int(sample[3]), role)
 
     def test_episode_sampler_enforces_five_shot_and_disjoint_queries(self):
         labels = np.repeat(np.arange(20), 12)
@@ -568,6 +599,20 @@ class TestTrainingDataPipeline(unittest.TestCase):
         images, labels = next(iter(loader))
         self.assertEqual(images.shape[0], 6)
         self.assertEqual(torch.bincount(labels, minlength=3).tolist(), [2, 2, 2])
+
+    def test_class_balanced_sampler_respects_reference_pool_indices(self):
+        labels = np.repeat(np.arange(4), 10)
+        reference_indices = np.concatenate([
+            np.arange(cls * 10, cls * 10 + 5) for cls in range(4)
+        ])
+        sampler = ClassBalancedBatchSampler(
+            labels, classes_per_batch=3, samples_per_class=2,
+            seed=9, indices=reference_indices,
+        )
+        batch = next(iter(sampler))
+        self.assertTrue(set(batch).issubset(set(reference_indices.tolist())))
+        counts = np.bincount(labels[np.asarray(batch)], minlength=4)
+        self.assertEqual(sorted(counts[counts > 0].tolist()), [2, 2, 2])
 
     def test_exact_shot_validation_rejects_wrong_counts(self):
         from models.base.vsmr_trainer import validate_exact_shot

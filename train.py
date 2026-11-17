@@ -41,6 +41,9 @@ def get_command_line_parser():
     parser.add_argument('--vsmr_episode_novel_fraction', type=float, default=0.25)
     parser.add_argument('--vsmr_episode_max_shot', type=int, default=3)
     parser.add_argument('--vsmr_episode_reference_fraction', type=float, default=0.7)
+    parser.add_argument('--vsmr_episode_reference_samples_per_class', type=int, default=4)
+    parser.add_argument('--vsmr_smoke_test', action='store_true',
+                        help='Run one VSMR base epoch and only the first incremental session.')
     parser.add_argument('--vsmr_episode_novel_way', type=int, default=10)
     parser.add_argument('--vsmr_episode_base_query_way', type=int, default=16)
     parser.add_argument('--vsmr_episode_novel_shot', type=int, default=5)

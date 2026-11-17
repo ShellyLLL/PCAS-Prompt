@@ -27,6 +27,7 @@ ARGS = [
     "--vsmr_classes_per_batch", "16",
     "--vsmr_samples_per_class", "4",
     "--vsmr_episode_reference_fraction", "0.7",
+    "--vsmr_episode_reference_samples_per_class", "4",
     "--vsmr_episode_novel_way", "10",
     "--vsmr_episode_base_query_way", "16",
     "--vsmr_episode_novel_shot", "5",

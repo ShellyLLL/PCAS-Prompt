@@ -49,20 +49,22 @@ The flattened base component bank stores source-class ownership and component in
 
 ### 1.5 Pseudo-incremental training and learned transfer gate
 
-The training set is deterministically partitioned per class into a reference pool (default 70%) and a disjoint episode pool (default 30%). The split is exhaustive and path/index based; no image used to build the pseudo-base reference prototypes is eligible to be a support or query image in an episode.
+The training set is deterministically partitioned per class into a Reference Pool (default 70%) and a disjoint Episode Pool (default 30%). The Reference Pool is used for class-balanced base supervision and pseudo-base reference memory. The Episode Pool is reserved exclusively for pseudo-novel supports and independent base/novel queries. The split is exhaustive and index-based; no image crosses the two roles.
 
-At each base-training epoch, frozen-backbone features are refreshed for the complete base training set using the current decomposer. One reference prototype is built for every base class. Each episode then hides 10 pseudo-novel classes from this complete memory, uses exactly 5 support images per pseudo-novel class, and evaluates independent novel queries together with queries from 16 pseudo-base classes. Candidate classification includes every retained pseudo-base class plus all pseudo-novel classes (100 candidates for CUB-200's 100-base-class protocol). This replaces the earlier within-minibatch episode, which had only a small and variable candidate bank.
+Because ViT-B/16 is frozen, its deterministic CLS and Patch outputs are cached once for the base training set. These are backbone outputs only: no trainable Prompt-decomposed features are cached. For every training episode, the current decomposer processes a class-balanced set of reference exemplars (default 4 per retained base class), all pseudo-novel supports, and all queries with gradients enabled. Thus the episode loss updates the shared Prompt decomposition as well as the transfer gate, reconstructor, and fusion coefficient. Each episode hides 10 pseudo-novel classes from the complete set of 100 base classes, uses exactly 5 support images per pseudo-novel class, and evaluates independent novel queries together with queries from 16 pseudo-base classes. Candidate classification includes every retained pseudo-base class plus all pseudo-novel classes (100 candidates for CUB-200's 100-base-class protocol).
 
 
 The episode sampler is dataset-backed rather than restricted to the current class-balanced minibatch:
 
-1. Deterministically partition each base class into disjoint reference and episode image pools.
-2. Build one reference global/local prototype for every base class from the reference pool.
-3. Hide the selected pseudo-novel classes from that complete reference memory.
-4. Build exact 5-shot pseudo-novel global/local prototypes and OT-aligned support-dispersion statistics.
-5. Retrieve at most one component from each retained pseudo-base source class for every novel component.
-6. Use a trainable ReliabilityGate MLP to estimate component-wise transfer reliability.
-7. Classify both pseudo-base queries and independent pseudo-novel queries against all retained base classes plus all pseudo-novel classes.
+1. Deterministically partition each base class into disjoint Reference and Episode image pools.
+2. Restrict ordinary class-balanced base-supervision batches to Reference Pool indices.
+3. Cache only frozen ViT CLS/Patch outputs in the original full-dataset index space; non-contiguous Episode Pool indices therefore remain valid.
+4. For every episode, sample the configured number of Reference Pool exemplars per retained base class and re-run them through the current trainable decomposer.
+5. Hide the selected pseudo-novel classes from the differentiable pseudo-base reference memory.
+6. Build exact 5-shot pseudo-novel global/local prototypes and OT-aligned support-dispersion statistics from live decomposer outputs.
+7. Retrieve at most one component from each retained pseudo-base source class for every novel component.
+8. Use a trainable ReliabilityGate MLP to estimate component-wise transfer reliability.
+9. Classify both pseudo-base queries and independent pseudo-novel queries against all retained base classes plus all pseudo-novel classes.
 
 The gate receives the novel component, retrieved component, their product and absolute difference, retrieval similarity, top-source margin, normalized retrieval entropy, support dispersion, and log shot count. Its output is learned from pseudo-incremental global/local/joint classification losses. It is not a fixed similarity heuristic.
 
@@ -145,6 +147,18 @@ python train.py --method vsmr -project base -dataset cub200 -vit \\
   --vsmr_episode_max_shot 3 --vsmr_joint_weight 1.0
 \`\`\`
 
+## 4.1 CUB-200 real-data smoke test
+
+Before a full run, execute one base-training epoch and the first real 5-shot incremental session:
+
+~~~bash
+export FSCIL_DATA_ROOT=/data/lx/fscil/data
+export FSCIL_INDEX_LIST_ROOT="$FSCIL_DATA_ROOT/index_list"
+python run_script/vsmr_cub200_smoke.py
+~~~
+
+The smoke run checks real CUB image loading, the Reference/Episode split, full-index episode sampling, one differentiable base epoch, 5-shot support validation, the first incremental update, and evaluation over all 110 seen classes. Its summary is explicitly marked complete_fscil=false; partial AA/PD must not be reported as final FSCIL results.
+
 ## 5. Main configuration
 
 | Setting | Default |
@@ -154,6 +168,7 @@ python train.py --method vsmr -project base -dataset cub200 -vit \\
 | Balanced Prompt-Patch Sinkhorn epsilon / iterations | 1.0 / 50 |
 | Prompt orthogonality / component diversity weights | 0.2 / 0.1 |
 | Base batch classes / images per class | 16 / 4 |
+| Differentiable reference exemplars per retained base class / episode | 4 |
 | Pseudo-novel class fraction | 0.25 |
 | Pseudo-incremental maximum shots | 3 |
 | Gate hidden dimension | 384 |
@@ -192,4 +207,4 @@ python -m py_compile train.py models/base/vsmr_modules.py models/base/vsmr_losse
 python -m unittest discover -s tests -p 'test_vsmr.py' -v
 \`\`\`
 
-The VSMR tests cover frozen-backbone and incremental-freeze contracts, soft Prompt gradients, balanced OT marginals and permutation invariance, OT barycenters, leave-one-out classification, source-class-balanced retrieval, learned gate gradients, support dispersion, query Patch-conditioned Q/K/V reconstruction, append-only memory, and pseudo-incremental gate/reconstructor training.
+The VSMR tests cover frozen-backbone and incremental-freeze contracts, soft Prompt gradients, balanced OT marginals and permutation invariance, OT barycenters, leave-one-out classification, source-class-balanced retrieval, learned gate gradients, support dispersion, query Patch-conditioned Q/K/V reconstruction, append-only memory, Reference-Pool-only base sampling, non-contiguous global episode indices, and pseudo-incremental gradients through the live decomposer, transfer gate, and reconstructor.
