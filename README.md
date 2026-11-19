@@ -14,17 +14,17 @@ Please follow [CEC](https://github.com/icoz69/CEC-CVPR2021) to download *mini*-I
 
 ### Requirement
 
-- `torch==1.13.1`
-- `torchvision==0.14.1`
-- `yacs==0.1.8` 
-- `tqdm==4.66.1`
-- `ftfy==6.1.1`
-- `regex==2023.10.3`
-- `scikit-learn==1.3.2`
+- \`torch==1.13.1\`
+- \`torchvision==0.14.1\`
+- \`yacs==0.1.8\`
+- \`tqdm==4.66.1\`
+- \`ftfy==6.1.1\`
+- \`regex==2023.10.3\`
+- \`scikit-learn==1.3.2\`
 
 ## Experiments
 
-First, remember to modify the data path `ROOT` in the `dataset` configuration file.
+First, remember to modify the data path \`ROOT\` in the dataset configuration file.
 
 ~~~BASH
 # CIFAR BIMC
@@ -46,6 +46,27 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
 ~~~
 
+## CSPC V2.1
+
+The dev branch also includes an initial CSPC V2.1 implementation. It keeps the CLIP image and text encoders frozen, trains one shared text prompt on the base session, and continues prompt/scorer/gate optimization with real incremental-session K-shot samples. It does not create pseudo-incremental tasks and does not replay historical images. Historical visual prototypes are kept fixed; only base prototypes are used as transfer sources, while all seen prototypes participate in the unified visual classifier.
+
+The initial configuration values are starting points for controlled experiments, not claimed optimal hyperparameters. Review and tune them only through the planned validation and ablation protocol.
+
+Example:
+
+~~~BASH
+# MiniImageNet CSPC V2.1
+python main.py --data_cfg ./configs/datasets/miniimagenet.yaml --train_cfg ./configs/trainers/cspc.yaml
+
+# CUB200 CSPC V2.1
+python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/cspc.yaml
+
+# CIFAR100 CSPC V2.1
+python main.py --data_cfg ./configs/datasets/cifar100.yaml --train_cfg ./configs/trainers/cspc.yaml
+~~~
+
+CSPC checkpoints and session metrics are written under the configured TRAINER.CSPC.OUTPUT_DIR. Checkpoints contain prompts, transfer parameters, and prototype memory; they do not store historical images or per-image features.
+
 ## Acknowledgment
 
 In this repository, we build our code based on the following excellent open-source projects. We sincerely thank all the authors for sharing their great work:
@@ -57,5 +78,3 @@ In this repository, we build our code based on the following excellent open-sour
 - [AdaptCLIPZS](https://github.com/cvl-umass/AdaptCLIPZS)
 - [LibContinual](https://github.com/RL-VIG/LibContinual)
 - [LibFewShot](https://github.com/RL-VIG/LibFewShot)
-
-

@@ -1,0 +1,41 @@
+METHOD: "CSPC"
+SEED: 1
+
+DEVICE:
+  DEVICE_NAME: "cuda"
+  GPU_ID: "0;"
+
+DATALOADER:
+  TRAIN:
+    BATCH_SIZE_BASE: 64
+    BATCH_SIZE_INC: 64
+  TEST:
+    BATCH_SIZE: 100
+  NUM_WORKERS: 4
+
+MODEL:
+  BACKBONE:
+    NAME: "ViT-B/16"
+
+TRAINER:
+  CSPC:
+    PREC: "fp32"
+    N_CTX: 4
+    PROMPT_INIT_TEXT: "a photo of a"
+
+    BASE_EPOCHS: 20
+    INC_EPOCHS: 10
+    BASE_LR: 0.001
+    INC_PROMPT_LR: 0.0002
+    INC_SCORER_LR: 0.005
+    INC_GATE_LR: 0.005
+    WEIGHT_DECAY: 0.0
+
+    SCORER_TAU: 0.1
+    ALPHA_IMG_TXT: 1.0
+    BETA_SEM: 0.1
+    GAMMA_PROX: 0.01
+    GRAD_CLIP: 1.0
+    TEXT_CHUNK_SIZE: 64
+
+    OUTPUT_DIR: "./output/cspc"
