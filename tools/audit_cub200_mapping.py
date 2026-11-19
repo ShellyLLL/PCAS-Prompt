@@ -7,6 +7,7 @@ images.txt, image_class_labels.txt, train_test_split.txt, and images/.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import sys
@@ -14,7 +15,32 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from datasets.cub200 import CLASSES
+
+
+def load_canonical_classes(repo_root: Path) -> List[str]:
+    """Read CLASSES from datasets/cub200.py without importing training dependencies."""
+    source_path = repo_root / "datasets" / "cub200.py"
+    if not source_path.is_file():
+        raise FileNotFoundError(f"Cannot locate canonical CUB class file: {source_path}")
+
+    module = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    for node in module.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "CLASSES"
+            for target in node.targets
+        ):
+            classes = ast.literal_eval(node.value)
+            if not isinstance(classes, list) or not classes or not all(
+                isinstance(name, str) and name.strip() for name in classes
+            ):
+                raise ValueError(f"CLASSES in {source_path} must be a non-empty list of strings")
+            return classes
+
+    raise ValueError(f"Could not find a literal CLASSES list in {source_path}")
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CLASSES = load_canonical_classes(REPO_ROOT)
 
 
 def normalize_name(value: str) -> str:
@@ -235,7 +261,7 @@ def audit_dataset(
 
     errors = []
     if class_audit["status"] != "verified":
-        errors.append("classes.txt class IDs/names do not match datasets.cub200.CLASSES.")
+        errors.append("classes.txt class IDs/names do not match the CLASSES list in datasets/cub200.py.")
     if description_audit["status"] != "verified":
         errors.append("CUB description JSON keys/content do not cover classes.txt exactly.")
     errors.extend(record_audit["errors"])

@@ -1,15 +1,39 @@
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from tools.audit_cub200_mapping import (
+    CLASSES,
     audit_class_names,
     audit_description_names,
     audit_image_records,
     normalize_name,
     read_id_value_file,
 )
+
+
+
+class CUB200CLILaunchTests(unittest.TestCase):
+    def test_cli_starts_from_outside_repository_without_pythonpath(self):
+        script_path = Path(__file__).resolve().parents[1] / "tools" / "audit_cub200_mapping.py"
+        with tempfile.TemporaryDirectory() as working_directory:
+            result = subprocess.run(
+                [sys.executable, str(script_path), "--help"],
+                cwd=working_directory,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("--check-image-files", result.stdout)
+
+    def test_canonical_classes_are_loaded_without_importing_dataset_package(self):
+        self.assertEqual(len(CLASSES), 200)
+        self.assertEqual(CLASSES[0], "Black footed Albatross")
 
 
 class CUB200NameAuditTests(unittest.TestCase):
