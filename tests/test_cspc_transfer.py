@@ -77,6 +77,57 @@ class PrototypeTransferTests(unittest.TestCase):
         self.assertAlmostEqual(float(info["margin"]), 0.0, places=6)
 
 
+class CSPCConfigurationValidationTests(unittest.TestCase):
+    @staticmethod
+    def make_runner(inc_shot=5):
+        runner = CSPCRunner.__new__(CSPCRunner)
+        runner.device = torch.device("cpu")
+        runner.class_names = ["class zero", "class one", "class two"]
+        runner.base_class_ids = [0, 1]
+        runner.data_manager = types.SimpleNamespace(
+            class_index_in_task=[[0, 1], [2]],
+            num_total_classes=3,
+        )
+        runner.cfg = types.SimpleNamespace(
+            DATASET=types.SimpleNamespace(
+                NUM_CLASSES=3,
+                NUM_INIT_CLS=2,
+                NUM_INC_CLS=1,
+                NUM_BASE_SHOT=-1,
+                NUM_INC_SHOT=inc_shot,
+            ),
+            TRAINER=types.SimpleNamespace(
+                CSPC=types.SimpleNamespace(
+                    BASE_EPOCHS=2,
+                    INC_EPOCHS=2,
+                    TEXT_CHUNK_SIZE=8,
+                    N_CTX=2,
+                    GRAD_CLIP=1.0,
+                    SCORER_TAU=0.1,
+                    BASE_LR=0.001,
+                    INC_PROMPT_LR=0.001,
+                    INC_SCORER_LR=0.001,
+                    INC_GATE_LR=0.001,
+                    WEIGHT_DECAY=0.0,
+                )
+            ),
+            DATALOADER=types.SimpleNamespace(
+                TRAIN=types.SimpleNamespace(BATCH_SIZE_BASE=4, BATCH_SIZE_INC=4),
+                TEST=types.SimpleNamespace(BATCH_SIZE=4),
+                NUM_WORKERS=0,
+            ),
+        )
+        return runner
+
+    def test_valid_few_shot_configuration_passes(self):
+        self.make_runner()._validate_session_partition()
+
+    def test_zero_incremental_shot_is_rejected_before_training(self):
+        runner = self.make_runner(inc_shot=0)
+        with self.assertRaisesRegex(ValueError, "NUM_INC_SHOT must be positive"):
+            runner._validate_session_partition()
+
+
 class EngineHelperTests(unittest.TestCase):
     def test_local_target_mapping_and_unknown_rejection(self):
         labels = torch.tensor([7, 5, 6, 5])
