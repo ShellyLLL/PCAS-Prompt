@@ -52,7 +52,7 @@ class CUB200(DatasetBase):
     @staticmethod
     def _normalize_class_name(name):
         name = re.sub(r"^\s*\d+\.", "", str(name))
-        name = name.replace("_", " ").replace("-", " ")
+        name = name.replace("'", "").replace("_", " ").replace("-", " ")
         name = re.sub(r"[^A-Za-z0-9\s]", " ", name)
         return " ".join(name.lower().split())
 
