@@ -61,8 +61,8 @@ class CUB200NameAuditTests(unittest.TestCase):
 
     def test_class_name_typo_is_detected(self):
         result = audit_class_names(
-            {1: "141.Arctic_Tern"},
-            ["Artic Tern"],
+            {1: "141.Common_Tern"},
+            ["Arctic Tern"],
         )
         self.assertEqual(result["status"], "mismatch")
         self.assertEqual(result["name_mismatches"][0]["class_id"], 1)
@@ -96,9 +96,9 @@ class CUB200DescriptionAuditTests(unittest.TestCase):
                 json.dumps({"Artic Tern": ["A tern."]}),
                 encoding="utf-8",
             )
-            result = audit_description_names(path, {1: "141.Arctic_Tern"})
+            result = audit_description_names(path, {1: "141.Common_Tern"})
             self.assertEqual(result["status"], "mismatch")
-            self.assertEqual(result["missing_keys"], ["141.Arctic_Tern"])
+            self.assertEqual(result["missing_keys"], ["141.Common_Tern"])
             self.assertEqual(result["extra_keys"], ["Artic Tern"])
 
 
@@ -197,10 +197,19 @@ class CUB200RuntimeLoaderTests(unittest.TestCase):
         result = audit_class_names(metadata, CUB_CLASSES)
         self.assertEqual(result["status"], "verified")
 
+    def test_released_artic_tern_metadata_alias_is_accepted(self):
+        metadata = {
+            class_id: f"{class_id:03d}." + class_name.replace(" ", "_")
+            for class_id, class_name in enumerate(CUB_CLASSES, start=1)
+        }
+        metadata[141] = "141.Artic_Tern"
+        result = audit_class_names(metadata, CUB_CLASSES)
+        self.assertEqual(result["status"], "verified")
+
     def test_runtime_rejects_class_metadata_name_mismatch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "CUB_200_2011"
-            self._write_dataset(root, class_141_name="Artic_Tern")
+            self._write_dataset(root, class_141_name="Common_Tern")
             with self.assertRaisesRegex(ValueError, "class ID 141"):
                 CUB200(str(root))
 
