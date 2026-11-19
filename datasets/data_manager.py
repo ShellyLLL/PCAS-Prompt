@@ -25,15 +25,37 @@ class DatasetManager:
         self.train_batchsize_inc = cfg.DATALOADER.TRAIN.BATCH_SIZE_INC
         self.test_batchsize = cfg.DATALOADER.TEST.BATCH_SIZE
 
-        # setup data
+        self._validate_config()
+
+        # Load and validate the complete class-indexed dataset before creating
+        # FSCIL sessions. This prevents invalid split settings from failing
+        # later inside range(), sampling, or the first training epoch.
         self._setup_data(self.root, self.dataset_name)
-        self.class_index_in_task = []
-        self.class_index_in_task.append(np.arange(0, self.num_init_cls))
+        self.class_index_in_task = [
+            np.arange(0, self.num_init_cls, dtype=np.int64)
+        ]
         for start in range(self.num_init_cls, self.num_total_classes, self.num_inc_cls):
             end = min(start + self.num_inc_cls, self.num_total_classes)
-            self.class_index_in_task.append(np.arange(start, end))
+            self.class_index_in_task.append(np.arange(start, end, dtype=np.int64))
         self.num_tasks = len(self.class_index_in_task)
         self.train_transform, self.test_transform = self._set_transform()
+
+    def _validate_config(self):
+        if self.num_init_cls <= 0:
+            raise ValueError("DATASET.NUM_INIT_CLS must be positive.")
+        if self.num_inc_cls <= 0:
+            raise ValueError("DATASET.NUM_INC_CLS must be positive.")
+        if self.num_base_shot != -1 and self.num_base_shot <= 0:
+            raise ValueError("DATASET.NUM_BASE_SHOT must be -1 or a positive integer.")
+        if self.num_inc_shot <= 0:
+            raise ValueError("DATASET.NUM_INC_SHOT must be positive.")
+
+        if self.train_batchsize_base <= 0 or self.train_batchsize_inc <= 0:
+            raise ValueError("Training batch sizes must be positive.")
+        if self.test_batchsize <= 0:
+            raise ValueError("Test batch size must be positive.")
+        if self.num_workers < 0:
+            raise ValueError("DATALOADER.NUM_WORKERS cannot be negative.")
 
 
 
@@ -51,7 +73,90 @@ class DatasetManager:
             self.test_targets = np.array(self.test_targets)
         
         self.num_total_classes = len(self.class_names)
-    
+        if self.num_total_classes <= 0:
+            raise ValueError("The selected dataset does not define any classes.")
+        if self.num_init_cls > self.num_total_classes:
+            raise ValueError(
+                f"NUM_INIT_CLS={self.num_init_cls} exceeds the dataset class count "
+                f"({self.num_total_classes})."
+            )
+        if len(set(self.class_names)) != self.num_total_classes:
+            raise ValueError("Dataset class names must be unique.")
+
+        self._validate_dataset_targets()
+
+    def _validate_dataset_targets(self):
+        for split_name, targets in (
+            ("train", self.train_targets),
+            ("test", self.test_targets),
+        ):
+            if targets.ndim != 1:
+                raise ValueError(
+                    f"The {split_name} labels must be a one-dimensional class-ID array."
+                )
+            if targets.size == 0:
+                raise ValueError(f"The {split_name} split is empty.")
+            if not np.issubdtype(targets.dtype, np.integer):
+                raise TypeError(
+                    f"The {split_name} labels must contain integer class IDs; "
+                    f"got dtype {targets.dtype}."
+                )
+            invalid = np.where(
+                (targets < 0) | (targets >= self.num_total_classes)
+            )[0]
+            if invalid.size:
+                bad_values = np.unique(targets[invalid])[:10].tolist()
+                raise ValueError(
+                    f"The {split_name} split contains out-of-range class IDs "
+                    f"{bad_values}; expected [0, {self.num_total_classes - 1}]."
+                )
+
+        train_counts = np.bincount(
+            self.train_targets.astype(np.int64), minlength=self.num_total_classes
+        )
+        test_counts = np.bincount(
+            self.test_targets.astype(np.int64), minlength=self.num_total_classes
+        )
+        missing_train = np.flatnonzero(train_counts == 0).tolist()
+        missing_test = np.flatnonzero(test_counts == 0).tolist()
+        if missing_train:
+            raise ValueError(
+                f"Training split has no images for class IDs {missing_train[:20]}."
+            )
+        if missing_test:
+            raise ValueError(
+                f"Test split has no images for class IDs {missing_test[:20]}."
+            )
+
+        if self.num_base_shot > 0:
+            insufficient_base = np.flatnonzero(
+                train_counts[: self.num_init_cls] < self.num_base_shot
+            )
+            if insufficient_base.size:
+                details = {
+                    int(class_id): int(train_counts[class_id])
+                    for class_id in insufficient_base[:20]
+                }
+                raise ValueError(
+                    f"NUM_BASE_SHOT={self.num_base_shot} exceeds available training "
+                    f"samples for base classes: {details}."
+                )
+
+        novel_counts = train_counts[self.num_init_cls :]
+        insufficient_novel = np.flatnonzero(novel_counts < self.num_inc_shot)
+        if insufficient_novel.size:
+            class_ids = (
+                insufficient_novel + self.num_init_cls
+            ).astype(np.int64)
+            details = {
+                int(class_id): int(train_counts[class_id])
+                for class_id in class_ids[:20]
+            }
+            raise ValueError(
+                f"NUM_INC_SHOT={self.num_inc_shot} exceeds available training "
+                f"samples for incremental classes: {details}."
+            )
+
 
     def get_dataset(self, task_id, source, mode=None, accumulated_past=False):
         '''
@@ -149,36 +254,54 @@ class DatasetManager:
 
 
     def _select_data_from_class_index(self, x, y, class_idx, shot, source):
+        if source not in {"train", "test"}:
+            raise ValueError(f"Invalid data source: {source!r}")
+        if len(class_idx) == 0:
+            raise ValueError("Cannot construct a task dataset with no classes.")
+
         ret_x = []
         ret_y = []
         if isinstance(x, list):
-            x = np.array(x)
-        for c in class_idx:
-            idx_c = np.where(y == c)[0]
-            
-            if shot is not None and source == 'train':
-                # Random choosing index
-                # NOTE: Only when training, we can modify the num of samples
-                # assert shot <= len(idx_c), f"shot {shot} should not be greater than {len(idx_c)}"
+            x = np.asarray(x)
+
+        for class_id in class_idx:
+            class_id = int(class_id)
+            class_indices = np.flatnonzero(y == class_id)
+            available = int(class_indices.size)
+            if available == 0:
+                raise ValueError(
+                    f"The {source} split has no samples for class ID {class_id}."
+                )
+
+            if source == "train" and shot is not None:
+                shot = int(shot)
                 if shot == -1:
-                    idx_selected = idx_c
-                
-                elif shot > len(idx_c):
-                    # num of shot is greater than num of samples in this class
-                    # hence use all samples in this class
-                    print(f'shot:{shot} is greater than num of sample:{len(idx_c)} in class{c}')
-                    idx_selected = idx_c
+                    selected_indices = class_indices
+                elif shot <= 0:
+                    raise ValueError(
+                        "Training shot count must be -1 (all samples) or positive."
+                    )
+                elif available < shot:
+                    raise ValueError(
+                        f"Requested {shot}-shot sampling for class ID {class_id}, "
+                        f"but only {available} training samples are available. "
+                        "FSCIL sampling will not silently fall back to fewer shots."
+                    )
                 else:
-                    idx_selected = np.random.choice(idx_c, size=shot, replace=False)
+                    selected_indices = np.random.choice(
+                        class_indices, size=shot, replace=False
+                    )
             else:
-                idx_selected = idx_c
+                selected_indices = class_indices
 
-            ret_x.append(x[idx_selected])
-            ret_y.append(y[idx_selected])
-        ret_x = np.concatenate(ret_x)
-        ret_y = np.concatenate(ret_y)
+            ret_x.append(x[selected_indices])
+            ret_y.append(y[selected_indices])
 
-        return ret_x, ret_y
+        selected_x = np.concatenate(ret_x, axis=0)
+        selected_y = np.concatenate(ret_y, axis=0)
+        if selected_x.shape[0] != selected_y.shape[0] or selected_x.shape[0] == 0:
+            raise RuntimeError("Selected task data and labels are empty or misaligned.")
+        return selected_x, selected_y
     
 
     def _set_transform(self):
@@ -204,7 +327,10 @@ class DatasetManager:
 
 class TaskDataset(Dataset):
     def __init__(self, images, labels, transform, class_to_task_id=None, class_name=None):
-        assert len(images) == len(labels), "Data size error!"
+        if len(images) != len(labels):
+            raise ValueError("Task dataset image and label counts do not match.")
+        if len(images) == 0:
+            raise ValueError("Cannot create an empty TaskDataset.")
         self.images = images
         self.labels = labels
         self.transform = transform
