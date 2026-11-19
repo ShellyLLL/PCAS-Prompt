@@ -54,7 +54,13 @@ class CUB200(DatasetBase):
         name = re.sub(r"^\s*\d+\.", "", str(name))
         name = name.replace("'", "").replace("_", " ").replace("-", " ")
         name = re.sub(r"[^A-Za-z0-9\s]", " ", name)
-        return " ".join(name.lower().split())
+        normalized = " ".join(name.lower().split())
+
+        # The released CUB-200 classes.txt spells class 141 as "Artic_Tern".
+        # Keep the canonical class/prompt name "Arctic Tern" while explicitly
+        # accepting this known metadata alias; do not relax other name checks.
+        known_metadata_aliases = {"artic tern": "arctic tern"}
+        return known_metadata_aliases.get(normalized, normalized)
 
     def _validate_class_metadata(self, class_file):
         class_records = self.list2dict(self.text_read(class_file))
