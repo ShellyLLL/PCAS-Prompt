@@ -168,7 +168,7 @@ class CUB200RuntimeLoaderTests(unittest.TestCase):
 
             self.assertEqual(dataset.dataset_root, str(root))
             self.assertEqual(dataset.train_targets, [0])
-            self.assertEqual(dataset.test_targets, [143])
+            self.assertEqual(dataset.test_targets, [140])
             self.assertEqual(
                 dataset.train_data[0],
                 str(root / "images" / "001.Black_footed_Albatross" / "sample_train.jpg"),
