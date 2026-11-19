@@ -418,7 +418,6 @@ class CSPCEndToEndTests(unittest.TestCase):
                     BETA_SEM=0.1,
                     GAMMA_PROX=0.01,
                     GRAD_CLIP=1.0,
-                    TEXT_CHUNK_SIZE=8,
                     OUTPUT_DIR=output_dir,
                 )
             ),
