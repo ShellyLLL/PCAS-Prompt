@@ -265,6 +265,10 @@ class FakeCLIP(nn.Module):
         self.visual.conv1 = nn.Conv2d(3, 4, 1)
         self.dtype = torch.float32
 
+    def encode_image(self, images):
+        features = self.visual.conv1(images)
+        return features.mean(dim=(2, 3))
+
 
 class PromptEncodingTests(unittest.TestCase):
     def cfg(self):
@@ -295,6 +299,14 @@ class PromptEncodingTests(unittest.TestCase):
         self.assertTrue(all(not p.requires_grad for p in model.clip_model.parameters()))
         self.assertTrue(model.prompt.requires_grad)
         self.assertEqual(model.transfer.scorer_weight.device, model.prompt.device)
+
+        model.train()
+        self.assertFalse(model.clip_model.training)
+        images = torch.randn(2, 3, 8, 8, requires_grad=True)
+        image_features = model.encode_images(images)
+        self.assertEqual(tuple(image_features.shape), (2, 4))
+        self.assertFalse(image_features.requires_grad)
+        self.assertIsNone(images.grad)
 
 
 if __name__ == "__main__":
