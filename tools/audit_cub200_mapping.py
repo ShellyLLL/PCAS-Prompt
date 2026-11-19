@@ -45,7 +45,7 @@ CLASSES = load_canonical_classes(REPO_ROOT)
 
 def normalize_name(value: str) -> str:
     value = re.sub(r"^\s*\d+\.", "", str(value))
-    value = value.replace("_", " ").replace("-", " ")
+    value = value.replace("'", "").replace("_", " ").replace("-", " ")
     value = re.sub(r"[^A-Za-z0-9\s]", " ", value)
     return " ".join(value.lower().split())
 
