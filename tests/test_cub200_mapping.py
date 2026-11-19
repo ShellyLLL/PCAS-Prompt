@@ -55,7 +55,7 @@ class CUB200NameAuditTests(unittest.TestCase):
 
     def test_class_name_typo_is_detected(self):
         result = audit_class_names(
-            {1: "144.Arctic_Tern"},
+            {1: "141.Arctic_Tern"},
             ["Artic Tern"],
         )
         self.assertEqual(result["status"], "mismatch")
@@ -90,9 +90,9 @@ class CUB200DescriptionAuditTests(unittest.TestCase):
                 json.dumps({"Artic Tern": ["A tern."]}),
                 encoding="utf-8",
             )
-            result = audit_description_names(path, {1: "144.Arctic_Tern"})
+            result = audit_description_names(path, {1: "141.Arctic_Tern"})
             self.assertEqual(result["status"], "mismatch")
-            self.assertEqual(result["missing_keys"], ["144.Arctic_Tern"])
+            self.assertEqual(result["missing_keys"], ["141.Arctic_Tern"])
             self.assertEqual(result["extra_keys"], ["Artic Tern"])
 
 
@@ -140,24 +140,24 @@ class CUB200RecordAuditTests(unittest.TestCase):
 
 class CUB200RuntimeLoaderTests(unittest.TestCase):
     @staticmethod
-    def _write_dataset(root, class_144_name=None):
+    def _write_dataset(root, class_141_name=None):
         root.mkdir(parents=True, exist_ok=True)
         (root / "images").mkdir(exist_ok=True)
 
         class_rows = []
         for class_id, class_name in enumerate(CUB_CLASSES, start=1):
             metadata_name = class_name.replace(" ", "_")
-            if class_id == 144 and class_144_name is not None:
-                metadata_name = class_144_name
+            if class_id == 141 and class_141_name is not None:
+                metadata_name = class_141_name
             class_rows.append(f"{class_id} {class_id:03d}.{metadata_name}")
         (root / "classes.txt").write_text("\n".join(class_rows) + "\n", encoding="utf-8")
 
         (root / "images.txt").write_text(
             "1 001.Black_footed_Albatross/sample_train.jpg\n"
-            "2 144.Arctic_Tern/sample_test.jpg\n",
+            "2 141.Arctic_Tern/sample_test.jpg\n",
             encoding="utf-8",
         )
-        (root / "image_class_labels.txt").write_text("1 1\n2 144\n", encoding="utf-8")
+        (root / "image_class_labels.txt").write_text("1 1\n2 141\n", encoding="utf-8")
         (root / "train_test_split.txt").write_text("1 1\n2 0\n", encoding="utf-8")
 
     def test_direct_cub_200_2011_root_is_loaded_without_duplicate_directory(self):
@@ -182,20 +182,20 @@ class CUB200RuntimeLoaderTests(unittest.TestCase):
             dataset = CUB200(str(parent))
             self.assertEqual(dataset.dataset_root, str(nested))
 
-    def test_class_144_uses_canonical_arctic_tern_name(self):
+    def test_class_141_uses_canonical_arctic_tern_name(self):
         metadata = {
             class_id: f"{class_id:03d}." + class_name.replace(" ", "_")
             for class_id, class_name in enumerate(CUB_CLASSES, start=1)
         }
-        self.assertEqual(metadata[144], "144.Arctic_Tern")
+        self.assertEqual(metadata[141], "141.Arctic_Tern")
         result = audit_class_names(metadata, CUB_CLASSES)
         self.assertEqual(result["status"], "verified")
 
     def test_runtime_rejects_class_metadata_name_mismatch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "CUB_200_2011"
-            self._write_dataset(root, class_144_name="Artic_Tern")
-            with self.assertRaisesRegex(ValueError, "class ID 144"):
+            self._write_dataset(root, class_141_name="Artic_Tern")
+            with self.assertRaisesRegex(ValueError, "class ID 141"):
                 CUB200(str(root))
 
     def test_description_keys_cover_canonical_cub_classes(self):
