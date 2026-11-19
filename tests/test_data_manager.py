@@ -30,7 +30,7 @@ class DatasetManagerSamplingTests(unittest.TestCase):
         labels = np.asarray([0, 1, 1])
         with self.assertRaisesRegex(ValueError, "only 2 training samples"):
             manager._select_data_from_class_index(
-                images, labels, np.asarray([0]), 3, "train"
+                images, labels, np.asarray([1]), 3, "train"
             )
 
     def test_base_all_samples_setting_keeps_every_base_sample(self):
