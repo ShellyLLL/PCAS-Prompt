@@ -30,7 +30,6 @@ class CSPCRunner:
         self.base_class_ids = [int(x) for x in self.data_manager.class_index_in_task[0]]
         if self.base_class_ids != list(range(len(self.base_class_ids))):
             raise ValueError("Base classes must occupy the initial contiguous class IDs.")
-        self.base_texts = [self.class_descriptions[c] for c in self.base_class_ids]
         self._validate_session_partition()
 
         output_root = os.path.abspath(cfg.TRAINER.CSPC.OUTPUT_DIR)
@@ -46,9 +45,6 @@ class CSPCRunner:
         self.session_metrics: List[Dict] = []
         self.base_accuracy_at_session0 = None
         self.previous_parameters = None
-
-        self.output_dir = os.path.abspath(cfg.TRAINER.CSPC.OUTPUT_DIR)
-        os.makedirs(self.output_dir, exist_ok=True)
 
     @staticmethod
     def _normalize_name(name: str) -> str:
@@ -201,7 +197,7 @@ class CSPCRunner:
         self.model.train()
         for epoch in range(int(self.cfg.TRAINER.CSPC.BASE_EPOCHS)):
             optimizer.zero_grad(set_to_none=True)
-            text_features = self.model.encode_text(self.base_texts)
+            text_features = self._encode_class_descriptions(class_ids)
             logits = self.model.logit_scale * torch.matmul(features, text_features.t())
             loss = F.cross_entropy(logits, local_labels)
             if not torch.isfinite(loss):
