@@ -45,6 +45,12 @@ class CUB200NameAuditTests(unittest.TestCase):
             normalize_name("Black footed Albatross"),
         )
 
+    def test_apostrophe_in_official_cub_class_name_is_normalized(self):
+        self.assertEqual(
+            normalize_name("146.Forster's_Tern"),
+            normalize_name("Forsters Tern"),
+        )
+
     def test_class_ids_map_to_canonical_code_order(self):
         result = audit_class_names(
             {1: "001.Black_footed_Albatross", 2: "002.Laysan_Albatross"},
