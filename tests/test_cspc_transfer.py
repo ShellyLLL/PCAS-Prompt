@@ -309,5 +309,180 @@ class PromptEncodingTests(unittest.TestCase):
         self.assertIsNone(images.grad)
 
 
+
+class TinyFeatureDatasetManager:
+    def __init__(self, cfg):
+        self.dataset_name = "tiny"
+        self.class_names = ["class 0", "class 1", "class 2"]
+        self.class_index_in_task = [
+            torch.tensor([0, 1]).numpy(),
+            torch.tensor([2]).numpy(),
+        ]
+        self.num_tasks = 2
+        self.num_total_classes = 3
+        self.train_features = torch.tensor(
+            [
+                [1.00, 0.04, 0.00],
+                [0.98, 0.08, 0.00],
+                [0.04, 1.00, 0.00],
+                [0.08, 0.98, 0.00],
+                [0.02, 0.00, 1.00],
+                [0.04, 0.02, 0.98],
+            ],
+            dtype=torch.float32,
+        )
+        self.train_labels = torch.tensor([0, 0, 1, 1, 2, 2], dtype=torch.long)
+        self.test_features = self.train_features.clone()
+        self.test_labels = self.train_labels.clone()
+
+    def get_dataloader(self, task_id, source, mode=None, accumulate_past=False):
+        features = self.train_features if source == "train" else self.test_features
+        labels = self.train_labels if source == "train" else self.test_labels
+        if source == "train":
+            class_ids = self.class_index_in_task[task_id].tolist()
+        else:
+            class_ids = torch.cat(self.class_index_in_task[: task_id + 1]).tolist()
+        selected = torch.zeros_like(labels, dtype=torch.bool)
+        for class_id in class_ids:
+            selected |= labels == int(class_id)
+        features = features[selected]
+        labels = labels[selected]
+        return [
+            {"image": features[start : start + 2], "label": labels[start : start + 2]}
+            for start in range(0, len(labels), 2)
+        ]
+
+
+class TinyPromptModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.prompt = nn.Parameter(torch.zeros(3))
+        self.register_buffer(
+            "class_vectors",
+            torch.eye(3, dtype=torch.float32),
+        )
+        self.transfer = PrototypeTransfer(temperature=0.1)
+
+    @property
+    def logit_scale(self):
+        return self.prompt.new_tensor(10.0)
+
+    def encode_images(self, images):
+        with torch.no_grad():
+            return F.normalize(images.to(self.prompt.device).float(), dim=-1)
+
+    def encode_text(self, texts):
+        class_ids = [
+            int(text.rsplit(" ", 1)[-1].rstrip("."))
+            for text in texts
+        ]
+        vectors = self.class_vectors[class_ids]
+        return F.normalize(vectors + 0.05 * self.prompt.unsqueeze(0), dim=-1)
+
+
+class CSPCEndToEndTests(unittest.TestCase):
+    @staticmethod
+    def make_cfg(output_dir):
+        return types.SimpleNamespace(
+            DEVICE=types.SimpleNamespace(DEVICE_NAME="cpu"),
+            SEED=7,
+            DATASET=types.SimpleNamespace(
+                NAME="tiny",
+                NUM_CLASSES=3,
+                GPT_PATH="",
+                NUM_INIT_CLS=2,
+                NUM_INC_CLS=1,
+                NUM_BASE_SHOT=-1,
+                NUM_INC_SHOT=2,
+            ),
+            DATALOADER=types.SimpleNamespace(
+                TRAIN=types.SimpleNamespace(BATCH_SIZE_BASE=4, BATCH_SIZE_INC=2),
+                TEST=types.SimpleNamespace(BATCH_SIZE=2),
+                NUM_WORKERS=0,
+            ),
+            TRAINER=types.SimpleNamespace(
+                CSPC=types.SimpleNamespace(
+                    N_CTX=2,
+                    TEXT_CHUNK_SIZE=8,
+                    PREC="fp32",
+                    PROMPT_INIT_TEXT="a photo of a",
+                    BASE_EPOCHS=2,
+                    INC_EPOCHS=2,
+                    BASE_LR=0.01,
+                    INC_PROMPT_LR=0.005,
+                    INC_SCORER_LR=0.01,
+                    INC_GATE_LR=0.01,
+                    WEIGHT_DECAY=0.0,
+                    SCORER_TAU=0.1,
+                    ALPHA_IMG_TXT=1.0,
+                    BETA_SEM=0.1,
+                    GAMMA_PROX=0.01,
+                    GRAD_CLIP=1.0,
+                    TEXT_CHUNK_SIZE=8,
+                    OUTPUT_DIR=output_dir,
+                )
+            ),
+        )
+
+    def test_two_session_training_preserves_history_and_writes_complete_metrics(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            cfg = self.make_cfg(output_dir)
+            manager = TinyFeatureDatasetManager(cfg)
+            model = TinyPromptModel()
+            with mock.patch(
+                "engine.cspc_engine.DatasetManager", return_value=manager
+            ), mock.patch(
+                "engine.cspc_engine.CSPCModel", return_value=model
+            ):
+                runner = CSPCRunner(cfg)
+                runner.run()
+
+            self.assertEqual(runner.seen_class_ids, [0, 1, 2])
+            self.assertEqual(len(runner.session_metrics), 2)
+            self.assertEqual(tuple(runner.global_prototypes.shape), (3, 3))
+            self.assertTrue(torch.isfinite(runner.global_prototypes).all())
+
+            session0_path = os.path.join(
+                runner.output_dir, "session_00.pth"
+            )
+            session1_path = os.path.join(
+                runner.output_dir, "session_01.pth"
+            )
+            metrics_path = os.path.join(runner.output_dir, "metrics.json")
+            self.assertTrue(os.path.isfile(session0_path))
+            self.assertTrue(os.path.isfile(session1_path))
+            self.assertTrue(os.path.isfile(metrics_path))
+
+            session0 = torch.load(session0_path, map_location="cpu")
+            session1 = torch.load(session1_path, map_location="cpu")
+            self.assertTrue(
+                torch.equal(
+                    session0["global_prototypes"],
+                    session1["global_prototypes"][:2],
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    session0["base_prototypes"],
+                    session1["base_prototypes"],
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    session0["base_text_embeddings"],
+                    session1["base_text_embeddings"],
+                )
+            )
+
+            with open(metrics_path, "r", encoding="utf-8") as handle:
+                summary = json.load(handle)
+            for key in ("AA", "AA_class_macro", "PD"):
+                self.assertTrue(math.isfinite(float(summary[key])))
+            self.assertEqual(len(summary["sessions"]), 2)
+            self.assertEqual(
+                summary["sessions"][-1]["per_class_accuracy"].keys(),
+                {"0", "1", "2"},
+            )
+
 if __name__ == "__main__":
     unittest.main()
