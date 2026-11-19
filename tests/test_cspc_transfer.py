@@ -95,6 +95,71 @@ class EngineHelperTests(unittest.TestCase):
             CSPCRunner._build_prototypes(features[:2], torch.tensor([3, 3]), [3, 4])
 
 
+class RecordingTransfer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.supports = []
+
+    def forward(self, query_text, current_proto, support_features,
+                base_text_embeddings, base_prototypes):
+        self.supports.append(support_features.detach().clone())
+        return F.normalize(current_proto + 0.01 * query_text, dim=-1), {}
+
+
+class LOOTests(unittest.TestCase):
+    def test_loo_excludes_the_held_out_sample_from_its_own_class_prototype(self):
+        runner = CSPCRunner.__new__(CSPCRunner)
+        transfer = RecordingTransfer()
+        runner.model = types.SimpleNamespace(
+            transfer=transfer, logit_scale=torch.tensor(10.0)
+        )
+        runner.base_text_embeddings = F.normalize(torch.randn(2, 8), dim=-1)
+        runner.base_prototypes = F.normalize(torch.randn(2, 8), dim=-1)
+
+        # Each support image is an orthogonal basis vector, making leakage
+        # directly observable in the support tensors received by the scorer.
+        features = torch.eye(8)[:4]
+        labels = torch.tensor([0, 0, 1, 1])
+        class_ids = [0, 1]
+        current_text = F.normalize(torch.randn(2, 8), dim=-1)
+        old_prototypes = F.normalize(torch.randn(3, 8), dim=-1)
+        loss = runner._loo_loss(
+            features, labels, class_ids, current_text, old_prototypes
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(len(transfer.supports), 8)
+        # For query e0, call 0 builds class-0's prototype and must contain
+        # only e1, never the held-out e0 query.
+        self.assertEqual(tuple(transfer.supports[0].shape), (1, 8))
+        self.assertTrue(torch.equal(transfer.supports[0][0], features[1]))
+        self.assertFalse(bool((transfer.supports[0] == features[0]).all(dim=1).any()))
+        # For query e2, call 5 builds class-1's prototype and must contain e3.
+        self.assertEqual(tuple(transfer.supports[5].shape), (1, 8))
+        self.assertTrue(torch.equal(transfer.supports[5][0], features[3]))
+
+
+class DescriptionAggregationTests(unittest.TestCase):
+    def test_all_class_descriptions_contribute_to_one_normalized_embedding(self):
+        runner = CSPCRunner.__new__(CSPCRunner)
+        runner.class_descriptions = [["description A", "description B"], ["description C"]]
+
+        class TextModel:
+            def encode_text(self, texts):
+                vectors = {
+                    "description A": torch.tensor([1.0, 0.0, 0.0]),
+                    "description B": torch.tensor([0.0, 1.0, 0.0]),
+                    "description C": torch.tensor([0.0, 0.0, 1.0]),
+                }
+                return torch.stack([vectors[text] for text in texts])
+
+        runner.model = TextModel()
+        embeddings = runner._encode_class_descriptions([0, 1])
+        expected_first = F.normalize(torch.tensor([0.5, 0.5, 0.0]), dim=0)
+        self.assertTrue(torch.allclose(embeddings[0], expected_first))
+        self.assertTrue(torch.allclose(embeddings[1], torch.tensor([0.0, 0.0, 1.0])))
+
+
 class IdentityTransformer(nn.Module):
     def forward(self, x):
         return x
