@@ -48,7 +48,9 @@ class CSPCRunner:
 
     @staticmethod
     def _normalize_name(name: str) -> str:
-        return " ".join(name.lower().replace("_", " ").replace("-", " ").split())
+        normalized = str(name).lower().replace("'", "")
+        normalized = normalized.replace("_", " ").replace("-", " ")
+        return " ".join(normalized.split())
 
     def _load_class_texts(self, description_path: str) -> List[str]:
         if not description_path:
@@ -67,7 +69,23 @@ class CSPCRunner:
 
         with open(resolved, "r", encoding="utf-8") as handle:
             raw = json.load(handle)
-        normalized = {self._normalize_name(key): value for key, value in raw.items()}
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"CSPC class-description JSON must be an object: {resolved}"
+            )
+
+        normalized = {}
+        duplicate_keys = []
+        for original_key, value in raw.items():
+            key = self._normalize_name(original_key)
+            if key in normalized:
+                duplicate_keys.append(original_key)
+            normalized[key] = value
+        if duplicate_keys:
+            raise ValueError(
+                "CSPC class-description keys collide after normalization: "
+                + ", ".join(str(key) for key in duplicate_keys[:10])
+            )
 
         descriptions = []
         missing = []
