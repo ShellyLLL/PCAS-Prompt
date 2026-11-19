@@ -194,7 +194,7 @@ class CUB200RuntimeLoaderTests(unittest.TestCase):
     def test_runtime_rejects_class_metadata_name_mismatch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "CUB_200_2011"
-            self._write_dataset(root, class_144_name="144.Artic_Tern")
+            self._write_dataset(root, class_144_name="Artic_Tern")
             with self.assertRaisesRegex(ValueError, "class ID 144"):
                 CUB200(str(root))
 
