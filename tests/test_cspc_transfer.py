@@ -1,5 +1,6 @@
 import json
 import math
+import numpy as np
 import os
 import tempfile
 import sys
@@ -488,6 +489,77 @@ class CSPCEndToEndTests(unittest.TestCase):
                 summary["sessions"][-1]["per_class_accuracy"].keys(),
                 {"0", "1", "2"},
             )
+
+
+class CSPCDatasetPreflightTests(unittest.TestCase):
+    class FakeManager:
+        def __init__(self, short_novel=False):
+            self.dataset_name = "tiny"
+            self.class_names = ["class 0", "class 1", "class 2"]
+            self.class_index_in_task = [
+                np.asarray([0, 1], dtype=np.int64),
+                np.asarray([2], dtype=np.int64),
+            ]
+            self.num_tasks = 2
+            self.num_total_classes = 3
+            self.train_targets = np.asarray(
+                [0, 0, 1, 1, 2] if short_novel else [0, 0, 1, 1, 2, 2],
+                dtype=np.int64,
+            )
+            self.test_targets = np.asarray([0, 1, 2], dtype=np.int64)
+            self.train_data = np.zeros((len(self.train_targets), 3), dtype=np.float32)
+            self.test_data = np.zeros((3, 3), dtype=np.float32)
+
+        def get_dataset(self, task_id, source, mode=None, accumulated_past=False):
+            labels = self.train_targets if source == "train" else self.test_targets
+            if source == "train":
+                class_ids = self.class_index_in_task[task_id].tolist()
+            else:
+                class_ids = [
+                    int(class_id)
+                    for group in self.class_index_in_task[: task_id + 1]
+                    for class_id in group
+                ]
+            selected = labels[np.isin(labels, class_ids)]
+            return types.SimpleNamespace(labels=selected)
+
+    @staticmethod
+    def cfg():
+        return types.SimpleNamespace(
+            METHOD="CSPC",
+            DATASET=types.SimpleNamespace(
+                NAME="tiny",
+                ROOT="unused",
+                GPT_PATH="",
+                NUM_CLASSES=3,
+                NUM_INIT_CLS=2,
+                NUM_INC_CLS=1,
+                NUM_BASE_SHOT=-1,
+                NUM_INC_SHOT=2,
+            ),
+        )
+
+    def test_preflight_accepts_complete_two_session_partition(self):
+        from tools import validate_cspc_dataset
+
+        manager = self.FakeManager()
+        with mock.patch.object(validate_cspc_dataset, "setup_cfg", return_value=self.cfg()), \\
+             mock.patch.object(validate_cspc_dataset, "DatasetManager", return_value=manager):
+            report = validate_cspc_dataset.validate_dataset("data.yaml", "cspc.yaml")
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["num_sessions"], 2)
+        self.assertEqual(report["description_classes"], 3)
+        self.assertEqual(report["sessions"][1]["train_sample_counts"], {"2": 2})
+
+    def test_preflight_rejects_incorrect_incremental_shot_count(self):
+        from tools import validate_cspc_dataset
+
+        manager = self.FakeManager(short_novel=True)
+        with mock.patch.object(validate_cspc_dataset, "setup_cfg", return_value=self.cfg()), \\
+             mock.patch.object(validate_cspc_dataset, "DatasetManager", return_value=manager):
+            with self.assertRaisesRegex(ValueError, "expected 2 training samples"):
+                validate_cspc_dataset.validate_dataset("data.yaml", "cspc.yaml")
+
 
 if __name__ == "__main__":
     unittest.main()
