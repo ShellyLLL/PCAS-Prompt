@@ -1,4 +1,7 @@
+import json
 import math
+import os
+import tempfile
 import sys
 import types
 import unittest
@@ -209,6 +212,39 @@ class DescriptionAggregationTests(unittest.TestCase):
         expected_first = F.normalize(torch.tensor([0.5, 0.5, 0.0]), dim=0)
         self.assertTrue(torch.allclose(embeddings[0], expected_first))
         self.assertTrue(torch.allclose(embeddings[1], torch.tensor([0.0, 0.0, 1.0])))
+
+
+    def test_description_key_normalization_handles_possessive_apostrophe(self):
+        self.assertEqual(
+            CSPCRunner._normalize_name("Forster's_Tern"),
+            CSPCRunner._normalize_name("Forsters Tern"),
+        )
+
+    def test_duplicate_normalized_description_keys_are_rejected(self):
+        runner = CSPCRunner.__new__(CSPCRunner)
+        runner.class_names = ["Forsters Tern"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "descriptions.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "Forster's Tern": ["description A"],
+                        "Forsters Tern": ["description B"],
+                    },
+                    handle,
+                )
+            with self.assertRaisesRegex(ValueError, "collide after normalization"):
+                runner._load_class_texts(path)
+
+    def test_non_object_description_json_is_rejected(self):
+        runner = CSPCRunner.__new__(CSPCRunner)
+        runner.class_names = ["class zero"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "descriptions.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(["not", "a", "mapping"], handle)
+            with self.assertRaisesRegex(ValueError, "must be an object"):
+                runner._load_class_texts(path)
 
 
 class IdentityTransformer(nn.Module):
