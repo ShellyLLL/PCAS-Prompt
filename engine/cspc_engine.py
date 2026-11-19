@@ -97,8 +97,26 @@ class CSPCRunner:
             raise ValueError("FSCIL sessions must partition all class IDs exactly once in order.")
         if int(self.cfg.DATASET.NUM_INIT_CLS) != len(self.base_class_ids):
             raise ValueError("NUM_INIT_CLS does not match the base session.")
+        if int(self.cfg.DATASET.NUM_INIT_CLS) <= 0:
+            raise ValueError("NUM_INIT_CLS must be positive.")
         if int(self.cfg.DATASET.NUM_INC_CLS) <= 0:
             raise ValueError("NUM_INC_CLS must be positive.")
+
+        base_shot = int(self.cfg.DATASET.NUM_BASE_SHOT)
+        inc_shot = int(self.cfg.DATASET.NUM_INC_SHOT)
+        if base_shot != -1 and base_shot <= 0:
+            raise ValueError("NUM_BASE_SHOT must be -1 (all samples) or a positive integer.")
+        if inc_shot <= 0:
+            raise ValueError("NUM_INC_SHOT must be positive for real FSCIL sessions.")
+
+        for name in ("BATCH_SIZE_BASE", "BATCH_SIZE_INC"):
+            if int(getattr(self.cfg.DATALOADER.TRAIN, name)) <= 0:
+                raise ValueError(f"DATALOADER.TRAIN.{name} must be positive.")
+        if int(self.cfg.DATALOADER.TEST.BATCH_SIZE) <= 0:
+            raise ValueError("DATALOADER.TEST.BATCH_SIZE must be positive.")
+        if int(self.cfg.DATALOADER.NUM_WORKERS) < 0:
+            raise ValueError("DATALOADER.NUM_WORKERS cannot be negative.")
+
         for name in ("BASE_EPOCHS", "INC_EPOCHS", "TEXT_CHUNK_SIZE", "N_CTX", "GRAD_CLIP", "SCORER_TAU"):
             if float(getattr(self.cfg.TRAINER.CSPC, name)) <= 0:
                 raise ValueError(f"TRAINER.CSPC.{name} must be positive.")
