@@ -372,6 +372,8 @@ class TinyPromptModel(nn.Module):
             return F.normalize(images.to(self.prompt.device).float(), dim=-1)
 
     def encode_text(self, texts):
+        if isinstance(texts, str):
+            texts = [texts]
         class_ids = [
             int(text.rsplit(" ", 1)[-1].rstrip("."))
             for text in texts
