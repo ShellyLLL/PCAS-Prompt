@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from datasets.cub200 import CUB200, CLASSES as CUB_CLASSES
+
 from tools.audit_cub200_mapping import (
     CLASSES,
     audit_class_names,
@@ -132,6 +134,82 @@ class CUB200RecordAuditTests(unittest.TestCase):
             path.write_text("1 bird\n1 dog\n", encoding="utf-8")
             with self.assertRaises(ValueError):
                 read_id_value_file(path)
+
+
+
+
+class CUB200RuntimeLoaderTests(unittest.TestCase):
+    @staticmethod
+    def _write_dataset(root, class_144_name=None):
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "images").mkdir(exist_ok=True)
+
+        class_rows = []
+        for class_id, class_name in enumerate(CUB_CLASSES, start=1):
+            metadata_name = class_name.replace(" ", "_")
+            if class_id == 144 and class_144_name is not None:
+                metadata_name = class_144_name
+            class_rows.append(f"{class_id} {class_id:03d}.{metadata_name}")
+        (root / "classes.txt").write_text("\n".join(class_rows) + "\n", encoding="utf-8")
+
+        (root / "images.txt").write_text(
+            "1 001.Black_footed_Albatross/sample_train.jpg\n"
+            "2 144.Arctic_Tern/sample_test.jpg\n",
+            encoding="utf-8",
+        )
+        (root / "image_class_labels.txt").write_text("1 1\n2 144\n", encoding="utf-8")
+        (root / "train_test_split.txt").write_text("1 1\n2 0\n", encoding="utf-8")
+
+    def test_direct_cub_200_2011_root_is_loaded_without_duplicate_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "CUB_200_2011"
+            self._write_dataset(root)
+            dataset = CUB200(str(root))
+
+            self.assertEqual(dataset.dataset_root, str(root))
+            self.assertEqual(dataset.train_targets, [0])
+            self.assertEqual(dataset.test_targets, [143])
+            self.assertEqual(
+                dataset.train_data[0],
+                str(root / "images" / "001.Black_footed_Albatross" / "sample_train.jpg"),
+            )
+
+    def test_parent_directory_layout_remains_supported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            nested = parent / "CUB_200_2011"
+            self._write_dataset(nested)
+            dataset = CUB200(str(parent))
+            self.assertEqual(dataset.dataset_root, str(nested))
+
+    def test_class_144_uses_canonical_arctic_tern_name(self):
+        metadata = {
+            class_id: f"{class_id:03d}." + class_name.replace(" ", "_")
+            for class_id, class_name in enumerate(CUB_CLASSES, start=1)
+        }
+        self.assertEqual(metadata[144], "144.Arctic_Tern")
+        result = audit_class_names(metadata, CUB_CLASSES)
+        self.assertEqual(result["status"], "verified")
+
+    def test_runtime_rejects_class_metadata_name_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "CUB_200_2011"
+            self._write_dataset(root, class_144_name="144.Artic_Tern")
+            with self.assertRaisesRegex(ValueError, "class ID 144"):
+                CUB200(str(root))
+
+    def test_description_keys_cover_canonical_cub_classes(self):
+        metadata = {
+            class_id: f"{class_id:03d}." + class_name.replace(" ", "_")
+            for class_id, class_name in enumerate(CUB_CLASSES, start=1)
+        }
+        description_path = (
+            Path(__file__).resolve().parents[1]
+            / "description"
+            / "modified_cub200_output.json"
+        )
+        result = audit_description_names(description_path, metadata)
+        self.assertEqual(result["status"], "verified", msg=str(result))
 
 
 if __name__ == "__main__":
