@@ -341,7 +341,11 @@ class TinyFeatureDatasetManager:
         if source == "train":
             class_ids = self.class_index_in_task[task_id].tolist()
         else:
-            class_ids = torch.cat(self.class_index_in_task[: task_id + 1]).tolist()
+            class_ids = [
+                int(class_id)
+                for task_classes in self.class_index_in_task[: task_id + 1]
+                for class_id in task_classes
+            ]
         selected = torch.zeros_like(labels, dtype=torch.bool)
         for class_id in class_ids:
             selected |= labels == int(class_id)
