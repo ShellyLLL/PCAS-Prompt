@@ -24,9 +24,20 @@ class CSPCRunner:
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
 
         self.class_names = list(self.data_manager.class_names)
-        self.class_texts = self._load_class_texts(cfg.DATASET.GPT_PATH)
+        if len(self.class_names) != int(cfg.DATASET.NUM_CLASSES):
+            raise ValueError("NUM_CLASSES does not match the dataset class-name list.")
+        self.class_descriptions = self._load_class_texts(cfg.DATASET.GPT_PATH)
         self.base_class_ids = [int(x) for x in self.data_manager.class_index_in_task[0]]
-        self.base_texts = [self.class_texts[c] for c in self.base_class_ids]
+        if self.base_class_ids != list(range(len(self.base_class_ids))):
+            raise ValueError("Base classes must occupy the initial contiguous class IDs.")
+        self.base_texts = [self.class_descriptions[c] for c in self.base_class_ids]
+        self._validate_session_partition()
+
+        output_root = os.path.abspath(cfg.TRAINER.CSPC.OUTPUT_DIR)
+        self.output_dir = os.path.join(
+            output_root, str(cfg.DATASET.NAME).lower(), f"seed_{int(cfg.SEED)}"
+        )
+        os.makedirs(self.output_dir, exist_ok=True)
 
         self.base_prototypes = None
         self.base_text_embeddings = None
@@ -62,28 +73,52 @@ class CSPCRunner:
             raw = json.load(handle)
         normalized = {self._normalize_name(key): value for key, value in raw.items()}
 
-        texts = []
+        descriptions = []
         missing = []
         for class_name in self.class_names:
             key = self._normalize_name(class_name)
             value = normalized.get(key)
-            if isinstance(value, list):
-                value = next((item.strip() for item in value if isinstance(item, str) and item.strip()), None)
-            elif isinstance(value, str):
-                value = value.strip()
-            else:
-                value = None
-            if not value:
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, list):
+                value = []
+            clean = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+            if not clean:
                 missing.append(class_name)
-                texts.append("")
-            else:
-                texts.append(value)
-
+            descriptions.append(clean)
         if missing:
-            raise KeyError(
-                "Missing CSPC descriptions for classes: " + ", ".join(missing[:10])
-            )
-        return texts
+            raise KeyError("Missing CSPC descriptions for classes: " + ", ".join(missing[:10]))
+        return descriptions
+
+    def _validate_session_partition(self):
+        flattened = [
+            int(class_id)
+            for task_classes in self.data_manager.class_index_in_task
+            for class_id in task_classes
+        ]
+        expected = list(range(len(self.class_names)))
+        if flattened != expected or len(set(flattened)) != len(flattened):
+            raise ValueError("FSCIL sessions must partition all class IDs exactly once in order.")
+        if int(self.cfg.DATASET.NUM_INIT_CLS) != len(self.base_class_ids):
+            raise ValueError("NUM_INIT_CLS does not match the base session.")
+        if int(self.cfg.DATASET.NUM_INC_CLS) <= 0:
+            raise ValueError("NUM_INC_CLS must be positive.")
+        for name in ("BASE_EPOCHS", "INC_EPOCHS", "TEXT_CHUNK_SIZE", "N_CTX", "GRAD_CLIP", "SCORER_TAU"):
+            if float(getattr(self.cfg.TRAINER.CSPC, name)) <= 0:
+                raise ValueError(f"TRAINER.CSPC.{name} must be positive.")
+        for name in ("BASE_LR", "INC_PROMPT_LR", "INC_SCORER_LR", "INC_GATE_LR", "WEIGHT_DECAY"):
+            if float(getattr(self.cfg.TRAINER.CSPC, name)) < 0:
+                raise ValueError(f"TRAINER.CSPC.{name} cannot be negative.")
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was selected but is not available.")
+
+    def _encode_class_descriptions(self, class_ids: Sequence[int]) -> torch.Tensor:
+        features = []
+        for class_id in class_ids:
+            descriptions = self.class_descriptions[int(class_id)]
+            embeddings = self.model.encode_text(descriptions)
+            features.append(F.normalize(embeddings.mean(dim=0), dim=-1))
+        return torch.stack(features, dim=0)
 
     def _collect_features(self, task_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         loader = self.data_manager.get_dataloader(
@@ -101,7 +136,13 @@ class CSPCRunner:
 
         if not feature_batches:
             raise RuntimeError(f"No training features were collected for session {task_id}.")
-        return torch.cat(feature_batches, dim=0), torch.cat(label_batches, dim=0)
+        features = torch.cat(feature_batches, dim=0).float()
+        labels = torch.cat(label_batches, dim=0).long()
+        expected = [int(x) for x in self.data_manager.class_index_in_task[task_id]]
+        observed = sorted(int(x) for x in torch.unique(labels).cpu().tolist())
+        if observed != expected:
+            raise ValueError(f"Session {task_id} labels {observed} do not match expected {expected}.")
+        return features, labels
 
     @staticmethod
     def _local_targets(labels: torch.Tensor, class_ids: Sequence[int]) -> torch.Tensor:
@@ -178,7 +219,7 @@ class CSPCRunner:
         self.model.eval()
         with torch.no_grad():
             self.base_prototypes, _ = self._build_prototypes(features, labels, class_ids)
-            self.base_text_embeddings = self.model.encode_text(self.base_texts).detach()
+            self.base_text_embeddings = self._encode_class_descriptions(self.base_class_ids).detach()
             self.global_prototypes = self.base_prototypes.detach().clone()
         self.seen_class_ids = list(class_ids)
         self.previous_parameters = self._snapshot_trainable_parameters()
@@ -274,14 +315,13 @@ class CSPCRunner:
             weight_decay=float(self.cfg.TRAINER.CSPC.WEIGHT_DECAY),
         )
 
-        current_texts = [self.class_texts[class_id] for class_id in class_ids]
         old_prototypes = self.global_prototypes.detach().clone()
         self.model.train()
 
         for epoch in range(int(self.cfg.TRAINER.CSPC.INC_EPOCHS)):
             optimizer.zero_grad(set_to_none=True)
-            current_text_features = self.model.encode_text(current_texts)
-            current_base_text = self.model.encode_text(self.base_texts)
+            current_text_features = self._encode_class_descriptions(class_ids)
+            current_base_text = self._encode_class_descriptions(self.base_class_ids)
 
             image_text_logits = self.model.logit_scale * torch.matmul(
                 features, current_text_features.t()
@@ -333,7 +373,7 @@ class CSPCRunner:
 
         self.model.eval()
         with torch.no_grad():
-            current_text_features = self.model.encode_text(current_texts)
+            current_text_features = self._encode_class_descriptions(class_ids)
             current_prototypes, support_sets = self._build_prototypes(features, labels, class_ids)
             calibrated = []
             gate_values = []
@@ -387,6 +427,9 @@ class CSPCRunner:
                 (predictions[mask] == int(class_id)).float().mean().item() * 100.0
             )
 
+        missing = [int(c) for c in self.seen_class_ids if str(int(c)) not in class_accuracy]
+        if missing:
+            raise ValueError(f"Test split has no samples for seen classes: {missing[:10]}")
         class_avg = float(np.mean(list(class_accuracy.values())))
         base_values = [
             value for class_id, value in class_accuracy.items()
@@ -441,13 +484,15 @@ class CSPCRunner:
         class_avg_values = [
             item["class_average_accuracy"] for item in self.session_metrics
         ]
-        average_accuracy = float(np.mean(class_avg_values))
+        average_accuracy = float(np.mean([m["sample_accuracy"] for m in self.session_metrics]))
+        average_class_accuracy = float(np.mean(class_avg_values))
         final_base_accuracy = self.session_metrics[-1]["base_class_accuracy"]
         performance_drop = float(self.base_accuracy_at_session0 - final_base_accuracy)
 
         summary = {
             "method": "CSPC-V2.1",
             "AA": average_accuracy,
+            "AA_class_macro": average_class_accuracy,
             "PD": performance_drop,
             "final_sample_accuracy": self.session_metrics[-1]["sample_accuracy"],
             "final_class_average_accuracy": self.session_metrics[-1]["class_average_accuracy"],

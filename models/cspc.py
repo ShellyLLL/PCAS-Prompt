@@ -29,18 +29,40 @@ class PrototypeTransfer(nn.Module):
         base_text_embeddings: torch.Tensor,
         base_prototypes: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if query_text.ndim != 1 or current_proto.ndim != 1:
+            raise ValueError("query_text and current_proto must be rank-1 feature vectors.")
+        if query_text.shape != current_proto.shape:
+            raise ValueError("query_text and current_proto must have the same feature dimension.")
+        if base_text_embeddings.ndim != 2 or base_prototypes.ndim != 2:
+            raise ValueError("Base text embeddings and prototypes must be rank-2 tensors.")
+        if base_text_embeddings.shape != base_prototypes.shape:
+            raise ValueError("Base text embeddings and visual prototypes must have matching shapes.")
+        if base_prototypes.shape[0] == 0:
+            raise ValueError("CSPC requires at least one base class prototype.")
+        if base_prototypes.shape[1] != query_text.shape[0]:
+            raise ValueError("Base and current features must share the same embedding dimension.")
+        if support_features.ndim != 2 or support_features.shape[0] == 0:
+            raise ValueError("support_features must be a non-empty [K, D] tensor.")
+        if support_features.shape[1] != query_text.shape[0]:
+            raise ValueError("support_features has an incompatible embedding dimension.")
+
+        tensors = (
+            query_text, current_proto, support_features,
+            base_text_embeddings, base_prototypes,
+        )
+        if any(tensor.device != query_text.device for tensor in tensors):
+            raise ValueError("All prototype-transfer inputs must be on the same device.")
+        if self.scorer_weight.device != query_text.device:
+            raise RuntimeError(
+                "PrototypeTransfer parameters and feature tensors are on different devices. "
+                "Move the complete CSPC model to the selected device."
+            )
+
         query_text = F.normalize(query_text.float(), dim=-1)
         current_proto = F.normalize(current_proto.float(), dim=-1)
         base_text_embeddings = F.normalize(base_text_embeddings.float(), dim=-1)
         base_prototypes = F.normalize(base_prototypes.float(), dim=-1)
         support_features = F.normalize(support_features.float(), dim=-1)
-
-        if base_prototypes.ndim != 2 or base_text_embeddings.ndim != 2:
-            raise ValueError("Base text embeddings and prototypes must be rank-2 tensors.")
-        if base_prototypes.shape[0] != base_text_embeddings.shape[0]:
-            raise ValueError("Base text embeddings and visual prototypes must share class order.")
-        if base_prototypes.shape[0] == 0:
-            raise ValueError("CSPC requires at least one base class prototype.")
 
         s_tt = torch.matmul(base_text_embeddings, query_text)
         s_vv = torch.matmul(base_prototypes, current_proto)
@@ -52,10 +74,7 @@ class PrototypeTransfer(nn.Module):
         weighted_base = torch.matmul(transfer_weights, base_prototypes)
         transfer_proto = F.normalize(weighted_base, dim=-1)
 
-        if support_features.numel() == 0:
-            intra_uncertainty = current_proto.new_zeros(())
-        else:
-            intra_uncertainty = 1.0 - torch.matmul(support_features, current_proto).mean()
+        intra_uncertainty = 1.0 - torch.matmul(support_features, current_proto).mean()
 
         num_base = int(transfer_weights.numel())
         entropy = -(transfer_weights * torch.log(transfer_weights.clamp_min(1e-8))).sum()
@@ -108,6 +127,10 @@ class CSPCModel(nn.Module):
         self.text_chunk_size = int(cfg.TRAINER.CSPC.TEXT_CHUNK_SIZE)
         if self.n_ctx <= 0:
             raise ValueError("N_CTX must be positive.")
+        if self.text_chunk_size <= 0:
+            raise ValueError("TEXT_CHUNK_SIZE must be positive.")
+        if cfg.TRAINER.CSPC.PREC not in {"fp16", "fp32"}:
+            raise ValueError("CSPC.PREC must be either 'fp16' or 'fp32'.")
 
         clip_model = load_clip_to_cpu(cfg)
         if cfg.TRAINER.CSPC.PREC == "fp32":
@@ -117,6 +140,11 @@ class CSPCModel(nn.Module):
         self.clip_model = clip_model.to(self.device)
         self.context_length = int(self.clip_model.positional_embedding.shape[0])
         self.text_width = int(self.clip_model.ln_final.weight.shape[0])
+        if self.n_ctx >= self.context_length - 1:
+            raise ValueError(
+                f"N_CTX={self.n_ctx} leaves fewer than two CLIP text tokens "
+                "for SOS and EOT."
+            )
 
         init_tokens = clip.tokenize(cfg.TRAINER.CSPC.PROMPT_INIT_TEXT)
         init_eot = int(init_tokens[0].argmax().item())
@@ -130,7 +158,10 @@ class CSPCModel(nn.Module):
             init_context = torch.cat((init_context, padding), dim=0)
         self.prompt = nn.Parameter(init_context.detach().clone())
 
-        self.transfer = PrototypeTransfer(cfg.TRAINER.CSPC.SCORER_TAU)
+        # The prompt and frozen CLIP are already on the requested device. The
+        # transfer module must be moved explicitly because CSPCModel itself is
+        # not subsequently wrapped in a model.to(device) call by the runner.
+        self.transfer = PrototypeTransfer(cfg.TRAINER.CSPC.SCORER_TAU).to(self.device)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -171,7 +202,10 @@ class CSPCModel(nn.Module):
         return F.normalize(text_features.float(), dim=-1)
 
     def encode_text(self, texts: Sequence[str]) -> torch.Tensor:
-        texts = list(texts)
+        if isinstance(texts, str):
+            texts = [texts]
+        else:
+            texts = list(texts)
         if not texts:
             raise ValueError("At least one class description is required.")
         chunks = []

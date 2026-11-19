@@ -50,7 +50,7 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 
 The dev branch also includes an initial CSPC V2.1 implementation. It keeps the CLIP image and text encoders frozen, trains one shared text prompt on the base session, and continues prompt/scorer/gate optimization with real incremental-session K-shot samples. It does not create pseudo-incremental tasks and does not replay historical images. Historical visual prototypes are kept fixed; only base prototypes are used as transfer sources, while all seen prototypes participate in the unified visual classifier.
 
-The initial configuration values are starting points for controlled experiments, not claimed optimal hyperparameters. Review and tune them only through the planned validation and ablation protocol.
+The initial configuration values are starting points for controlled experiments, not claimed optimal hyperparameters. Review and tune them only through the planned validation and ablation protocol. All non-empty class descriptions in the JSON file are encoded and averaged into one normalized class text feature.
 
 Example:
 
@@ -65,7 +65,7 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 python main.py --data_cfg ./configs/datasets/cifar100.yaml --train_cfg ./configs/trainers/cspc.yaml
 ~~~
 
-CSPC checkpoints and session metrics are written under the configured TRAINER.CSPC.OUTPUT_DIR. Checkpoints contain prompts, transfer parameters, and prototype memory; they do not store historical images or per-image features.
+CSPC checkpoints and session metrics are written under TRAINER.CSPC.OUTPUT_DIR/<dataset>/seed_<seed>, preventing different dataset/seed runs from overwriting each other. AA is the arithmetic mean of session-level overall sample accuracies; AA_class_macro is reported separately as the mean of session-level class-macro accuracies. PD is the drop in base-class macro accuracy from session 0 to the final session. Checkpoints contain prompts, transfer parameters, and prototype memory; they do not store historical images or per-image features.
 
 ## Acknowledgment
 
