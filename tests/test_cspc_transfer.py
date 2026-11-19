@@ -543,8 +543,10 @@ class CSPCDatasetPreflightTests(unittest.TestCase):
         from tools import validate_cspc_dataset
 
         manager = self.FakeManager()
-        with mock.patch.object(validate_cspc_dataset, "setup_cfg", return_value=self.cfg()), \\
-             mock.patch.object(validate_cspc_dataset, "DatasetManager", return_value=manager):
+        with (
+            mock.patch.object(validate_cspc_dataset, "setup_cfg", return_value=self.cfg()),
+            mock.patch.object(validate_cspc_dataset, "DatasetManager", return_value=manager),
+        ):
             report = validate_cspc_dataset.validate_dataset("data.yaml", "cspc.yaml")
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["num_sessions"], 2)
@@ -555,8 +557,10 @@ class CSPCDatasetPreflightTests(unittest.TestCase):
         from tools import validate_cspc_dataset
 
         manager = self.FakeManager(short_novel=True)
-        with mock.patch.object(validate_cspc_dataset, "setup_cfg", return_value=self.cfg()), \\
-             mock.patch.object(validate_cspc_dataset, "DatasetManager", return_value=manager):
+        with (
+            mock.patch.object(validate_cspc_dataset, "setup_cfg", return_value=self.cfg()),
+            mock.patch.object(validate_cspc_dataset, "DatasetManager", return_value=manager),
+        ):
             with self.assertRaisesRegex(ValueError, "expected 2 training samples"):
                 validate_cspc_dataset.validate_dataset("data.yaml", "cspc.yaml")
 
