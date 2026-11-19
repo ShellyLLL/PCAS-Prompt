@@ -78,3 +78,16 @@ In this repository, we build our code based on the following excellent open-sour
 - [AdaptCLIPZS](https://github.com/cvl-umass/AdaptCLIPZS)
 - [LibContinual](https://github.com/RL-VIG/LibContinual)
 - [LibFewShot](https://github.com/RL-VIG/LibFewShot)
+
+
+### MiniImageNet class-ID and description audit
+
+Before training CSPC on MiniImageNet, verify that the first-seen label order in the local CSV files agrees with the canonical class order and that every class has a description:
+
+~~~bash
+python tools/audit_miniimagenet_mapping.py \\
+  --root /path/to/dataset \\
+  --output ./miniimagenet_class_mapping_audit.json
+~~~
+
+The dataset root must contain miniimagenet/split/train.csv and miniimagenet/split/test.csv. If CSV labels are opaque identifiers (for example, WordNet IDs), provide a JSON file mapping every raw label to its human-readable class name. The audit exits with code 2 when CSV labels are opaque and no explicit mapping is supplied; this is intentionally not reported as a successful semantic mapping. Do not start the full experiment until the audit reports passed.
