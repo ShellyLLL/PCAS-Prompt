@@ -161,7 +161,7 @@ def main() -> int:
     if args.output:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(rendered + "\\n", encoding="utf-8")
+        output_path.write_text(rendered + "\n", encoding="utf-8")
         print(f"Saved preflight report: {output_path}")
     return 0
 
