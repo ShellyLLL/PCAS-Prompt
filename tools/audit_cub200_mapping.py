@@ -47,7 +47,9 @@ def normalize_name(value: str) -> str:
     value = re.sub(r"^\s*\d+\.", "", str(value))
     value = value.replace("'", "").replace("_", " ").replace("-", " ")
     value = re.sub(r"[^A-Za-z0-9\s]", " ", value)
-    return " ".join(value.lower().split())
+    normalized = " ".join(value.lower().split())
+    # Explicit alias used by the released CUB-200 classes.txt for class 141.
+    return {"artic tern": "arctic tern"}.get(normalized, normalized)
 
 
 def read_id_value_file(path: Path) -> Dict[int, str]:
