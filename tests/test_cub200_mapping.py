@@ -213,6 +213,14 @@ class CUB200RuntimeLoaderTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "class ID 141"):
                 CUB200(str(root))
 
+    def test_runtime_accepts_released_artic_tern_metadata_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "CUB_200_2011"
+            self._write_dataset(root, class_141_name="Artic_Tern")
+            dataset = CUB200(str(root))
+            self.assertEqual(dataset.get_class_name()[140], "Arctic Tern")
+            self.assertEqual(dataset.test_targets, [140])
+
     def test_description_keys_cover_canonical_cub_classes(self):
         metadata = {
             class_id: f"{class_id:03d}." + class_name.replace(" ", "_")
