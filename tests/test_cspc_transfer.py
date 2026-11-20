@@ -250,7 +250,9 @@ class DescriptionAggregationTests(unittest.TestCase):
 
 class IdentityTransformer(nn.Module):
     def forward(self, x):
-        return x
+        # Minimal sequence mixing so the selected EOT output depends on
+        # inserted prompt tokens, as it does in a real Transformer.
+        return x + x.mean(dim=0, keepdim=True)
 
 
 class FakeCLIP(nn.Module):
