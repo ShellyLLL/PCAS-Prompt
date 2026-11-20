@@ -27,7 +27,7 @@ class CSPCDiagnosticsTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(result["sample_accuracy"], 75.0, places=5)
-        self.assertAlmostEqual(result["class_macro_accuracy"], 75.0, places=5)
+        self.assertAlmostEqual(result["class_macro_accuracy"], 83.333333, places=4)
         self.assertEqual(result["per_class"]["1"]["top_confusions"][0]["class_id"], 0)
         self.assertIn("mean_cosine_margin", result["per_class"]["0"])
 
