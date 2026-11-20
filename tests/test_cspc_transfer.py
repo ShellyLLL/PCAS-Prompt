@@ -256,7 +256,7 @@ class IdentityTransformer(nn.Module):
 class FakeCLIP(nn.Module):
     def __init__(self):
         super().__init__()
-        self.token_embedding = nn.Embedding(32, 4)
+        self.token_embedding = nn.Embedding(50000, 4)
         self.positional_embedding = nn.Parameter(torch.zeros(8, 4))
         self.transformer = IdentityTransformer()
         self.ln_final = nn.LayerNorm(4)
