@@ -519,6 +519,17 @@ class CSPCEndToEndTests(unittest.TestCase):
                 summary = json.load(handle)
             for key in ("AA", "AA_class_macro", "PD"):
                 self.assertTrue(math.isfinite(float(summary[key])))
+            expected_pd = (
+                summary["sessions"][0]["sample_accuracy"]
+                - summary["sessions"][-1]["sample_accuracy"]
+            )
+            self.assertAlmostEqual(summary["PD"], expected_pd, places=6)
+            self.assertAlmostEqual(
+                summary["base_class_accuracy_drop"],
+                summary["sessions"][0]["base_class_accuracy"]
+                - summary["sessions"][-1]["base_class_accuracy"],
+                places=6,
+            )
             self.assertEqual(len(summary["sessions"]), 2)
             self.assertEqual(
                 summary["sessions"][-1]["per_class_accuracy"].keys(),
