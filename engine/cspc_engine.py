@@ -11,6 +11,7 @@ from tqdm import tqdm
 from datasets.data_manager import DatasetManager
 from models.cspc import CSPCModel
 from utils.evaluator import AccuracyEvaluator
+from utils.cspc_diagnostics import summarize_classifier, summarize_transfer
 
 
 class CSPCRunner:
@@ -40,7 +41,11 @@ class CSPCRunner:
 
         self.base_prototypes = None
         self.base_text_embeddings = None
+        self.base_text_embeddings_initial = None
         self.global_prototypes = None
+        self.raw_global_prototypes = None
+        self.session_transfer_diagnostics: List[Dict] = []
+        self.base_diagnostics = None
         self.seen_class_ids: List[int] = []
         self.session_metrics: List[Dict] = []
         self.base_class_accuracy_at_session0 = None
@@ -225,6 +230,10 @@ class CSPCRunner:
         class_ids = self.base_class_ids
         local_labels = self._local_targets(labels, class_ids)
 
+        self.model.eval()
+        with torch.no_grad():
+            self.base_text_embeddings_initial = self._encode_class_descriptions(class_ids).detach()
+
         optimizer = AdamW(
             [self.model.prompt],
             lr=float(self.cfg.TRAINER.CSPC.BASE_LR),
@@ -253,6 +262,7 @@ class CSPCRunner:
             self.base_prototypes, _ = self._build_prototypes(features, labels, class_ids)
             self.base_text_embeddings = self._encode_class_descriptions(self.base_class_ids).detach()
             self.global_prototypes = self.base_prototypes.detach().clone()
+            self.raw_global_prototypes = self.base_prototypes.detach().clone()
         self.seen_class_ids = list(class_ids)
         self.previous_parameters = self._snapshot_trainable_parameters()
 
@@ -409,6 +419,7 @@ class CSPCRunner:
             current_prototypes, support_sets = self._build_prototypes(features, labels, class_ids)
             calibrated = []
             gate_values = []
+            transfer_diagnostics = []
             for local_index, class_id in enumerate(class_ids):
                 calibrated_proto, diagnostics = self.model.transfer(
                     query_text=current_text_features[local_index],
@@ -419,12 +430,30 @@ class CSPCRunner:
                 )
                 calibrated.append(calibrated_proto)
                 gate_values.append(float(diagnostics["transfer_ratio"].item()))
+                transfer_diagnostics.append(
+                    summarize_transfer(
+                        class_id=class_id,
+                        class_name=self.class_names[class_id],
+                        diagnostics=diagnostics,
+                        raw_prototype=current_prototypes[local_index],
+                        calibrated_prototype=calibrated_proto,
+                        base_class_ids=self.base_class_ids,
+                        class_names=self.class_names,
+                    )
+                )
 
             calibrated_matrix = torch.stack(calibrated, dim=0)
+            # Raw and calibrated banks are maintained in parallel for
+            # same-test-set counterfactual diagnostics only. The raw bank is
+            # never used by training or the deployed classifier.
+            self.raw_global_prototypes = torch.cat(
+                (self.raw_global_prototypes.detach(), current_prototypes.detach()), dim=0
+            )
             # Historical prototypes are never recalibrated or overwritten.
             self.global_prototypes = torch.cat(
                 (self.global_prototypes.detach(), calibrated_matrix.detach()), dim=0
             )
+            self.session_transfer_diagnostics = transfer_diagnostics
         self.seen_class_ids.extend(class_ids)
         self.previous_parameters = self._snapshot_trainable_parameters()
         print(f"[Session {task_id}] transfer ratios: {gate_values}")
@@ -504,7 +533,11 @@ class CSPCRunner:
             "gate_bias": self.model.transfer.gate_bias.detach().cpu(),
             "base_prototypes": self.base_prototypes.detach().cpu(),
             "base_text_embeddings": self.base_text_embeddings.detach().cpu(),
+            "base_text_embeddings_initial": self.base_text_embeddings_initial.detach().cpu(),
             "global_prototypes": self.global_prototypes.detach().cpu(),
+            "raw_global_prototypes": self.raw_global_prototypes.detach().cpu(),
+            "session_transfer_diagnostics": self.session_transfer_diagnostics,
+            "base_diagnostics": self.base_diagnostics,
             "seen_class_ids": list(self.seen_class_ids),
             "metrics": self.session_metrics[-1],
         }
