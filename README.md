@@ -65,7 +65,7 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 python main.py --data_cfg ./configs/datasets/cifar100.yaml --train_cfg ./configs/trainers/cspc.yaml
 ~~~
 
-CSPC checkpoints and session metrics are written under TRAINER.CSPC.OUTPUT_DIR/<dataset>/seed_<seed>, preventing different dataset/seed runs from overwriting each other. AA is the arithmetic mean of session-level overall sample accuracies; AA_class_macro is reported separately as the mean of session-level class-macro accuracies. PD is the drop in base-class macro accuracy from session 0 to the final session. Checkpoints contain prompts, transfer parameters, and prototype memory; they do not store historical images or per-image features.
+CSPC checkpoints and session metrics are written under TRAINER.CSPC.OUTPUT_DIR/<dataset>/seed_<seed>, preventing different dataset/seed runs from overwriting each other. AA is the arithmetic mean of session-level overall sample accuracies; AA_class_macro is reported separately as the mean of session-level class-macro accuracies. PD is the drop in overall sample accuracy from the base session to the final incremental session, computed as Acc_0 - Acc_T. The base-class-only accuracy drop is reported separately as base_class_accuracy_drop. Checkpoints contain prompts, transfer parameters, and prototype memory; they do not store historical images or per-image features.
 
 ## Acknowledgment
 
