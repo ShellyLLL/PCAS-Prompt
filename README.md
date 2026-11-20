@@ -67,6 +67,8 @@ python main.py --data_cfg ./configs/datasets/cifar100.yaml --train_cfg ./configs
 
 CSPC checkpoints and session metrics are written under TRAINER.CSPC.OUTPUT_DIR/<dataset>/seed_<seed>, preventing different dataset/seed runs from overwriting each other. AA is the arithmetic mean of session-level overall sample accuracies; AA_class_macro is reported separately as the mean of session-level class-macro accuracies. PD is the drop in overall sample accuracy from the base session to the final incremental session, computed as Acc_0 - Acc_T. The base-class-only accuracy drop is reported separately as base_class_accuracy_drop. Checkpoints contain prompts, transfer parameters, and prototype memory; they do not store historical images or per-image features.
 
+CSPC diagnostic metrics are evaluation-only and do not affect optimization. At the base session, `metrics.json` compares the visual-prototype classifier with initial-prompt and trained-prompt text-prototype classifiers on the same held-out test images. At each incremental session, it compares raw K-shot prototypes against calibrated prototypes on the same cumulative test set, reporting sample/class-macro accuracy gains, per-class accuracy and cosine-margin/confusion summaries. Each new class also records its transfer ratio, normalized transfer entropy, top base-prototype weights, top-weight margin, and prototype angular shift. The parallel raw-prototype bank is used only for this counterfactual evaluation; the deployed classifier continues to use calibrated prototypes.
+
 ## Acknowledgment
 
 In this repository, we build our code based on the following excellent open-source projects. We sincerely thank all the authors for sharing their great work:
