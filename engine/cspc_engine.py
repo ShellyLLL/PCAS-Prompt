@@ -460,66 +460,133 @@ class CSPCRunner:
 
     def _evaluate_session(self, task_id: int) -> Dict:
         loader = self.data_manager.get_dataloader(task_id, source="test", mode="test")
-        logits_batches = []
+        feature_batches = []
         target_batches = []
         self.model.eval()
         with torch.no_grad():
             for batch in tqdm(loader, desc=f"Evaluate session {task_id}"):
                 features = self.model.encode_images(batch["image"].to(self.device))
-                logits = self.model.logit_scale * torch.matmul(
-                    features, self.global_prototypes.t()
-                )
-                logits_batches.append(logits)
+                feature_batches.append(features)
                 target_batches.append(
                     torch.as_tensor(batch["label"], device=self.device, dtype=torch.long)
                 )
 
-        logits = torch.cat(logits_batches, dim=0)
+        if not feature_batches:
+            raise RuntimeError(f"No test features were collected for session {task_id}.")
+        features = torch.cat(feature_batches, dim=0)
         targets = torch.cat(target_batches, dim=0)
-        result = self.evaluator.calc_accuracy(logits, targets, task_id)
+        seen_ids = list(self.seen_class_ids)
 
-        predictions = logits.argmax(dim=1)
-        class_accuracy = {}
-        for class_id in self.seen_class_ids:
-            mask = targets == int(class_id)
-            if not bool(mask.any()):
-                continue
-            class_accuracy[str(class_id)] = float(
-                (predictions[mask] == int(class_id)).float().mean().item() * 100.0
-            )
+        calibrated_summary = summarize_classifier(
+            features=features,
+            labels=targets,
+            prototypes=self.global_prototypes,
+            class_ids=seen_ids,
+            class_names=self.class_names,
+        )
+        raw_summary = summarize_classifier(
+            features=features,
+            labels=targets,
+            prototypes=self.raw_global_prototypes,
+            class_ids=seen_ids,
+            class_names=self.class_names,
+        )
 
-        missing = [int(c) for c in self.seen_class_ids if str(int(c)) not in class_accuracy]
-        if missing:
-            raise ValueError(f"Test split has no samples for seen classes: {missing[:10]}")
-        class_avg = float(np.mean(list(class_accuracy.values())))
-        base_values = [
-            value for class_id, value in class_accuracy.items()
-            if int(class_id) < len(self.base_class_ids)
-        ]
-        novel_values = [
-            value for class_id, value in class_accuracy.items()
-            if int(class_id) >= len(self.base_class_ids)
-        ]
-        base_avg = float(np.mean(base_values)) if base_values else 0.0
-        novel_avg = float(np.mean(novel_values)) if novel_values else 0.0
+        class_accuracy = calibrated_summary["per_class_accuracy"]
+        raw_class_accuracy = raw_summary["per_class_accuracy"]
+        class_gain = {
+            class_id: float(class_accuracy[class_id] - raw_class_accuracy[class_id])
+            for class_id in class_accuracy
+        }
+
+        base_ids = [class_id for class_id in seen_ids if class_id < len(self.base_class_ids)]
+        novel_ids = [class_id for class_id in seen_ids if class_id >= len(self.base_class_ids)]
+
+        def average_for_ids(values, ids):
+            selected = [float(values[str(class_id)]) for class_id in ids]
+            return float(np.mean(selected)) if selected else 0.0
 
         metrics = {
             "session": int(task_id),
-            "sample_accuracy": float(result["mean_acc"]),
-            "class_average_accuracy": class_avg,
-            "base_class_accuracy": base_avg,
-            "novel_class_accuracy": novel_avg,
-            "task_accuracy": result["task_acc"],
+            "sample_accuracy": calibrated_summary["sample_accuracy"],
+            "class_average_accuracy": calibrated_summary["class_macro_accuracy"],
+            "base_class_accuracy": average_for_ids(class_accuracy, base_ids),
+            "novel_class_accuracy": average_for_ids(class_accuracy, novel_ids),
+            "task_accuracy": self.evaluator.calc_accuracy(
+                self.model.logit_scale * (features @ self.global_prototypes.t()),
+                targets,
+                task_id,
+            )["task_acc"],
             "per_class_accuracy": class_accuracy,
+            "prototype_diagnostics": {
+                "raw_sample_accuracy": raw_summary["sample_accuracy"],
+                "raw_class_macro_accuracy": raw_summary["class_macro_accuracy"],
+                "raw_base_class_accuracy": average_for_ids(raw_class_accuracy, base_ids),
+                "raw_novel_class_accuracy": average_for_ids(raw_class_accuracy, novel_ids),
+                "calibrated_sample_accuracy_gain": (
+                    calibrated_summary["sample_accuracy"] - raw_summary["sample_accuracy"]
+                ),
+                "calibrated_class_macro_gain": (
+                    calibrated_summary["class_macro_accuracy"] - raw_summary["class_macro_accuracy"]
+                ),
+                "base_class_accuracy_gain": (
+                    average_for_ids(class_accuracy, base_ids)
+                    - average_for_ids(raw_class_accuracy, base_ids)
+                ),
+                "novel_class_accuracy_gain": (
+                    average_for_ids(class_accuracy, novel_ids)
+                    - average_for_ids(raw_class_accuracy, novel_ids)
+                ),
+                "per_class_accuracy_gain": class_gain,
+                "raw_per_class": raw_summary["per_class"],
+                "calibrated_per_class": calibrated_summary["per_class"],
+            },
         }
+
+        if task_id == 0:
+            initial_text_summary = summarize_classifier(
+                features=features,
+                labels=targets,
+                prototypes=self.base_text_embeddings_initial,
+                class_ids=seen_ids,
+                class_names=self.class_names,
+            )
+            trained_text_summary = summarize_classifier(
+                features=features,
+                labels=targets,
+                prototypes=self.base_text_embeddings,
+                class_ids=seen_ids,
+                class_names=self.class_names,
+            )
+            self.base_diagnostics = {
+                "visual_prototype": calibrated_summary,
+                "initial_prompt_text": initial_text_summary,
+                "trained_prompt_text": trained_text_summary,
+                "prompt_text_accuracy_gain": (
+                    trained_text_summary["sample_accuracy"]
+                    - initial_text_summary["sample_accuracy"]
+                ),
+                "visual_vs_trained_text_accuracy_gap": (
+                    calibrated_summary["sample_accuracy"]
+                    - trained_text_summary["sample_accuracy"]
+                ),
+            }
+            metrics["base_diagnostics"] = self.base_diagnostics
+
+        if task_id > 0:
+            metrics["transfer_diagnostics"] = self.session_transfer_diagnostics
+
         self.session_metrics.append(metrics)
         if task_id == 0:
-            self.base_class_accuracy_at_session0 = base_avg
+            self.base_class_accuracy_at_session0 = metrics["base_class_accuracy"]
 
         print(
             f"[Eval {task_id}] sample_acc={metrics['sample_accuracy']:.2f} "
-            f"class_avg={class_avg:.2f} base_avg={base_avg:.2f} "
-            f"novel_avg={novel_avg:.2f}"
+            f"class_avg={metrics['class_average_accuracy']:.2f} "
+            f"base_avg={metrics['base_class_accuracy']:.2f} "
+            f"novel_avg={metrics['novel_class_accuracy']:.2f} "
+            f"raw_acc={raw_summary['sample_accuracy']:.2f} "
+            f"calibration_gain={metrics['prototype_diagnostics']['calibrated_sample_accuracy_gain']:+.2f}"
         )
         return metrics
 
