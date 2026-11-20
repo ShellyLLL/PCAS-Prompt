@@ -484,6 +484,8 @@ class CSPCEndToEndTests(unittest.TestCase):
             self.assertEqual(len(runner.session_metrics), 2)
             self.assertEqual(tuple(runner.global_prototypes.shape), (3, 3))
             self.assertTrue(torch.isfinite(runner.global_prototypes).all())
+            self.assertEqual(tuple(runner.raw_global_prototypes.shape), (3, 3))
+            self.assertTrue(torch.isfinite(runner.raw_global_prototypes).all())
 
             session0_path = os.path.join(
                 runner.output_dir, "session_00.pth"
@@ -516,6 +518,15 @@ class CSPCEndToEndTests(unittest.TestCase):
                     session1["base_text_embeddings"],
                 )
             )
+            self.assertTrue(
+                torch.equal(
+                    session0["raw_global_prototypes"],
+                    session1["raw_global_prototypes"][:2],
+                )
+            )
+            self.assertIn("base_diagnostics", session0)
+            self.assertIn("session_transfer_diagnostics", session1)
+            self.assertEqual(len(session1["session_transfer_diagnostics"]), 1)
 
             with open(metrics_path, "r", encoding="utf-8") as handle:
                 summary = json.load(handle)
@@ -537,6 +548,12 @@ class CSPCEndToEndTests(unittest.TestCase):
                 summary["sessions"][-1]["per_class_accuracy"].keys(),
                 {"0", "1", "2"},
             )
+            self.assertIn("prototype_diagnostics", summary["sessions"][-1])
+            self.assertIn(
+                "calibrated_sample_accuracy_gain",
+                summary["sessions"][-1]["prototype_diagnostics"],
+            )
+            self.assertIn("base_diagnostics", summary["sessions"][0])
 
 
 class CSPCDatasetPreflightTests(unittest.TestCase):
