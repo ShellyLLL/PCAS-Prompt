@@ -309,6 +309,41 @@ class PromptEncodingTests(unittest.TestCase):
         self.assertFalse(image_features.requires_grad)
         self.assertIsNone(images.grad)
 
+    def test_text_checkpoint_preserves_prompt_gradient_across_chunks(self):
+        fake = FakeCLIP()
+
+        def tokenize(texts, context_length=77, truncate=False):
+            return torch.tensor([[1, 4, 5, 31, 0, 0]], dtype=torch.long).repeat(len(texts), 1)
+
+        cfg = self.cfg()
+        cfg.TRAINER.CSPC.TEXT_CHUNK_SIZE = 2
+        with mock.patch("models.cspc.load_clip_to_cpu", return_value=fake), \
+             mock.patch("models.cspc.clip.tokenize", side_effect=tokenize):
+            model = CSPCModel(cfg, torch.device("cpu"))
+
+        output = model.encode_text(["class one", "class two", "class three"])
+        output.square().sum().backward()
+        self.assertIsNotNone(model.prompt.grad)
+        self.assertTrue(torch.isfinite(model.prompt.grad).all())
+        self.assertGreater(float(model.prompt.grad.abs().sum()), 0.0)
+        self.assertTrue(all(parameter.grad is None for parameter in model.clip_model.parameters()))
+
+    def test_text_encoding_without_grad_does_not_require_checkpoint(self):
+        fake = FakeCLIP()
+
+        def tokenize(texts, context_length=77, truncate=False):
+            return torch.tensor([[1, 4, 5, 31, 0, 0]], dtype=torch.long).repeat(len(texts), 1)
+
+        with mock.patch("models.cspc.load_clip_to_cpu", return_value=fake), \
+             mock.patch("models.cspc.clip.tokenize", side_effect=tokenize):
+            model = CSPCModel(self.cfg(), torch.device("cpu"))
+
+        with torch.no_grad():
+            output = model.encode_text(["class one", "class two"])
+        self.assertFalse(output.requires_grad)
+        self.assertTrue(torch.isfinite(output).all())
+
+
 
 
 class TinyFeatureDatasetManager:
