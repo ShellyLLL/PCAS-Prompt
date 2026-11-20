@@ -43,7 +43,7 @@ class CSPCRunner:
         self.global_prototypes = None
         self.seen_class_ids: List[int] = []
         self.session_metrics: List[Dict] = []
-        self.base_accuracy_at_session0 = None
+        self.base_class_accuracy_at_session0 = None
         self.previous_parameters = None
 
     @staticmethod
@@ -485,7 +485,7 @@ class CSPCRunner:
         }
         self.session_metrics.append(metrics)
         if task_id == 0:
-            self.base_accuracy_at_session0 = base_avg
+            self.base_class_accuracy_at_session0 = base_avg
 
         print(
             f"[Eval {task_id}] sample_acc={metrics['sample_accuracy']:.2f} "
@@ -518,18 +518,25 @@ class CSPCRunner:
         ]
         average_accuracy = float(np.mean([m["sample_accuracy"] for m in self.session_metrics]))
         average_class_accuracy = float(np.mean(class_avg_values))
-        final_base_accuracy = self.session_metrics[-1]["base_class_accuracy"]
-        performance_drop = float(self.base_accuracy_at_session0 - final_base_accuracy)
+        initial_session_accuracy = float(self.session_metrics[0]["sample_accuracy"])
+        final_session_accuracy = float(self.session_metrics[-1]["sample_accuracy"])
+        performance_drop = initial_session_accuracy - final_session_accuracy
+
+        initial_base_accuracy = float(self.session_metrics[0]["base_class_accuracy"])
+        final_base_accuracy = float(self.session_metrics[-1]["base_class_accuracy"])
+        base_class_accuracy_drop = initial_base_accuracy - final_base_accuracy
 
         summary = {
             "method": "CSPC-V2.1",
             "AA": average_accuracy,
             "AA_class_macro": average_class_accuracy,
             "PD": performance_drop,
-            "final_sample_accuracy": self.session_metrics[-1]["sample_accuracy"],
+            "initial_session_accuracy": initial_session_accuracy,
+            "final_session_accuracy": final_session_accuracy,
             "final_class_average_accuracy": self.session_metrics[-1]["class_average_accuracy"],
-            "initial_base_class_accuracy": float(self.base_accuracy_at_session0),
-            "final_base_class_accuracy": float(final_base_accuracy),
+            "initial_base_class_accuracy": initial_base_accuracy,
+            "final_base_class_accuracy": final_base_accuracy,
+            "base_class_accuracy_drop": base_class_accuracy_drop,
             "sessions": self.session_metrics,
         }
         with open(os.path.join(self.output_dir, "metrics.json"), "w", encoding="utf-8") as handle:
@@ -537,7 +544,8 @@ class CSPCRunner:
         print(
             f"\n[CSPC Final] AA={average_accuracy:.2f} "
             f"PD={performance_drop:.2f} "
-            f"Final class-average={summary['final_class_average_accuracy']:.2f}"
+            f"Base-class drop={base_class_accuracy_drop:.2f} "
+            f"Final accuracy={final_session_accuracy:.2f}"
         )
 
     def run(self):
