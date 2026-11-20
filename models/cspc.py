@@ -4,6 +4,7 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 import models.clip.clip as clip
 from models.bimc import load_clip_to_cpu
@@ -192,7 +193,18 @@ class CSPCModel(nn.Module):
         x = torch.cat((token_embeddings[:, :1, :], prompt, token_embeddings[:, 1:, :]), dim=1)
         x = x + self.clip_model.positional_embedding[: self.context_length].to(dtype)
         x = x.permute(1, 0, 2)
-        x = self.clip_model.transformer(x)
+        # CLIP weights are frozen, but the shared prompt still requires
+        # gradients through every text-transformer block. Checkpoint the
+        # frozen transformer during prompt optimization so activations from
+        # all description chunks do not accumulate in GPU memory.
+        if torch.is_grad_enabled() and self.prompt.requires_grad:
+            x = checkpoint(
+                self.clip_model.transformer,
+                x,
+                use_reentrant=False,
+            )
+        else:
+            x = self.clip_model.transformer(x)
         x = x.permute(1, 0, 2)
         x = self.clip_model.ln_final(x).to(dtype)
 
